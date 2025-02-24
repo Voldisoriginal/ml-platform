@@ -1,0 +1,14 @@
+fastapi
+docker
+databases
+uvicorn[standard]
+scikit-learn
+pandas
+joblib
+psycopg2-binary  # Драйвер PostgreSQL
+celery
+redis
+python-multipart
+pydantic[email] # Для валидации email, если понадобится
+asyncpg # асинхронный драйвер
+SQLAlchemy

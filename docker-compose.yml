@@ -1,0 +1,143 @@
+version: '3.8'
+
+services:
+  web:
+    build: ./frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+    networks:
+      - my_network
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DATABASE_URL=postgresql://user:password@db:5432/dbname
+      - DOCKER_HOST=tcp://docker:2375  # Connect to docker:dind
+    depends_on:
+      docker:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      db:
+        condition: service_started
+    volumes:
+      - ./backend:/app
+      - ./uploads:/app/uploads
+      - ./models:/app/models
+    networks:
+      - my_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    healthcheck:
+        test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A main:celery worker -l info
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DATABASE_URL=postgresql://user:password@db:5432/dbname
+      - DOCKER_HOST=tcp://docker:2375  # Connect to docker:dind
+    depends_on:
+      redis:
+        condition: service_started
+      db:
+        condition: service_started
+      docker:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - ./uploads:/app/uploads
+      - ./models:/app/models
+    networks:
+      - my_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  redis:
+    image: "redis:alpine"
+    networks:
+      - my_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  db:
+    image: "postgres:13"
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: dbname
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - my_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  docker:
+    image: docker:dind
+    privileged: true
+    environment:
+      - DOCKER_TLS_CERTDIR=
+    volumes:
+      - ./models:/app/models  # Mount the models directory from the host
+      - ./inference-image.tar:/app/inference-image.tar  # Mount the inference image tar file
+    networks:
+      - my_network
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      - inference-image
+    entrypoint: |
+      /bin/sh -c "
+      echo 'Starting Docker daemon...'
+      dockerd --host=tcp://0.0.0.0:2375 --host=unix:///var/run/docker.sock &
+      echo 'Waiting for Docker daemon to start...'
+      while ! docker info > /dev/null 2>&1; do
+        sleep 1
+      done
+      echo 'Docker daemon started. Loading inference image...'
+      docker load -i /app/inference-image.tar || true
+      echo 'Inference image loaded. Creating network...'
+      docker network create my_network || true
+      echo 'Network created. Keeping the Docker daemon running...'
+      wait
+      "
+
+
+
+
+  inference-image:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.inference
+    image: inference-image:latest  # Tag the image
+    networks:
+      - my_network
+
+volumes:
+  postgres_data:
+networks:
+  my_network:
