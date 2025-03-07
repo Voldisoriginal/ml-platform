@@ -1,3 +1,4 @@
+# docker-compose.yml
 version: '3.8'
 
 services:
@@ -20,10 +21,9 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - DATABASE_URL=postgresql://user:password@db:5432/dbname
-      - DOCKER_HOST=tcp://docker:2375  # Connect to docker:dind
+      - DOCKER_HOST=unix:///var/run/docker.sock  # Explicitly set DOCKER_HOST
     depends_on:
-      docker:
-        condition: service_healthy
+      #  Remove dependency on docker:dind
       redis:
         condition: service_started
       db:
@@ -32,17 +32,13 @@ services:
       - ./backend:/app
       - ./uploads:/app/uploads
       - ./models:/app/models
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - my_network
     deploy:
       restart_policy:
         condition: on-failure
     command: uvicorn main:app --host 0.0.0.0 --port 8000
-    healthcheck:
-        test: ["CMD", "curl", "-f", "http://localhost:8000/"]
-        interval: 10s
-        timeout: 5s
-        retries: 5
 
   worker:
     build:
@@ -53,14 +49,13 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - DATABASE_URL=postgresql://user:password@db:5432/dbname
-      - DOCKER_HOST=tcp://docker:2375  # Connect to docker:dind
+      # Remove DOCKER_HOST
     depends_on:
       redis:
         condition: service_started
       db:
         condition: service_started
-      docker:
-        condition: service_healthy
+      # Remove docker:dind dependency
     volumes:
       - ./backend:/app
       - ./uploads:/app/uploads
@@ -93,49 +88,7 @@ services:
       restart_policy:
         condition: on-failure
 
-  docker:
-    image: docker:dind
-    privileged: true
-    environment:
-      - DOCKER_TLS_CERTDIR=
-    volumes:
-      - ./models:/app/models  # Mount the models directory from the host
-      - ./inference-image.tar:/app/inference-image.tar  # Mount the inference image tar file
-    networks:
-      - my_network
-    healthcheck:
-      test: ["CMD", "docker", "info"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    depends_on:
-      - inference-image
-    entrypoint: |
-      /bin/sh -c "
-      echo 'Starting Docker daemon...'
-      dockerd --host=tcp://0.0.0.0:2375 --host=unix:///var/run/docker.sock &
-      echo 'Waiting for Docker daemon to start...'
-      while ! docker info > /dev/null 2>&1; do
-        sleep 1
-      done
-      echo 'Docker daemon started. Loading inference image...'
-      docker load -i /app/inference-image.tar || true
-      echo 'Inference image loaded. Creating network...'
-      docker network create my_network || true
-      echo 'Network created. Keeping the Docker daemon running...'
-      wait
-      "
-
-
-
-
-  inference-image:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile.inference
-    image: inference-image:latest  # Tag the image
-    networks:
-      - my_network
+  #  Remove docker:dind service entirely.
 
 volumes:
   postgres_data:

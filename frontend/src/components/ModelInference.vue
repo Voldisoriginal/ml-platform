@@ -5,11 +5,11 @@
       <p>Inference is running:</p>
       <ul>
           <li>
-              <strong>Upload CSV:</strong>
+              <strong>API:</strong>
               <a :href="inferenceInfo.upload_url" target="_blank">{{ inferenceInfo.upload_url }}</a>
             </li>
             <li>
-              <strong>Send JSON:</strong>
+              <strong>Info: See docs on </strong>
               <a :href="inferenceInfo.json_url" target="_blank">{{ inferenceInfo.json_url }}</a>
           </li>
 

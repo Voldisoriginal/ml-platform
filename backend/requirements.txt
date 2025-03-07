@@ -9,6 +9,7 @@ psycopg2-binary  # Драйвер PostgreSQL
 celery
 redis
 python-multipart
+python-slugify
 pydantic[email] # Для валидации email, если понадобится
 asyncpg # асинхронный драйвер
 SQLAlchemy
