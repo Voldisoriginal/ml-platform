@@ -1,4 +1,3 @@
-# backend/main.py
 import traceback
 import logging
 import json
@@ -8,9 +7,9 @@ import os
 import io
 import pandas as pd
 from typing import List, Dict, Optional, Union, Any
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, validator, Field
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Response, Body
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Response
 import joblib
 # ML
 from sklearn.linear_model import LinearRegression
@@ -20,16 +19,15 @@ from sklearn.metrics import mean_squared_error, r2_score
 # Database
 import sqlalchemy
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import Session, sessionmaker, relationship
-from sqlalchemy import create_engine, Column, Integer, String, Float, JSON, LargeBinary, DateTime, ForeignKey, event
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import create_engine, Column, Integer, String, Float, JSON, LargeBinary, DateTime
+from datetime import datetime
 # Celery
 from celery import Celery, states
 from celery.exceptions import Ignore
 # Multiprocessing
 import multiprocessing
 from multiprocessing import Process, Queue, Event
-from slugify import slugify  # pip install python-slugify
-from datetime import datetime
 
 # --- Database Configuration ---
 DATABASE_URL = os.environ.get(
@@ -41,16 +39,6 @@ Base = declarative_base()
 
 
 # --- Database Models ---
-class Dataset(Base):
-    __tablename__ = "datasets"
-
-    id = Column(String, primary_key=True, index=True)
-    original_filename = Column(String)
-    filename = Column(String, unique=True)  # Unique filename in storage
-    upload_date = Column(DateTime, default=datetime.utcnow)
-    #  relationship - определяем как соотносятся модели и датасеты
-    models = relationship("DBModel", back_populates="dataset")
-
 class DBModel(Base):  # Таблица для хранения моделей
     __tablename__ = "trained_models"
 
@@ -60,10 +48,21 @@ class DBModel(Base):  # Таблица для хранения моделей
     metrics = Column(JSON)
     train_settings = Column(JSON)
     target_column = Column(String)
-    # dataset_filename = Column(String)  # filename  <- УДАЛЯЕМ
-    dataset_id = Column(String, ForeignKey("datasets.id")) #Добавляем связь
-    dataset = relationship("Dataset", back_populates="models") # Обратная связь
+    dataset_filename = Column(String)  # filename
     model_data = Column(LargeBinary)
+
+
+class Dataset(Base):
+    __tablename__ = "datasets"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    filename = Column(String, unique=True, index=True)  # Add unique constraint
+    upload_date = Column(DateTime, default=datetime.utcnow)
+    columns = Column(JSON)  # Store column names as JSON
+
+    def __repr__(self):
+        return f"<Dataset(id={self.id}, filename={self.filename}, upload_date={self.upload_date})>"
+
 
 # --- Celery Configuration ---
 CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", 'redis://redis:6379/0')
@@ -84,20 +83,6 @@ celery.conf.update(
 
 
 # --- Pydantic Models ---
-
-class DatasetBase(BaseModel):
-    original_filename: str
-    filename: str
-    upload_date: datetime
-
-class DatasetCreate(BaseModel):  # Для создания датасета
-    filename: str
-
-class DatasetResponse(DatasetBase):  # Для ответа API
-    id: str
-    class Config:
-        orm_mode = True
-
 class TrainSettings(BaseModel):
     train_size: float = 0.7
     random_state: int = 42
@@ -140,10 +125,16 @@ class TrainedModel(BaseModel):
     metrics: Dict[str, float]
     train_settings: TrainSettings
     target_column: str
-    # dataset_filename: str  <-  УДАЛЯЕМ
-    dataset:  DatasetResponse # Меняем на DatasetResponse
+    dataset_filename: str
+
+class DatasetModel(BaseModel):
+    id: str
+    filename: str
+    upload_date: datetime
+    columns: List[str]
+
     class Config:
-        orm_mode = True # <-  Чтобы подружить с sqlalchemy
+        orm_mode = True
 
 
 # --- FastAPI App ---
@@ -185,36 +176,15 @@ logger.addHandler(handler)
 
 
 @celery.task(bind=True, name='train_model_task')
-def train_model_task(self, dataset_id: str, target_column: str,  # dataset_filename -> dataset_id
+def train_model_task(self, dataset_filename: str, target_column: str,
                      train_settings: Dict, model_params: Dict):
     try:
         # 1. Загрузка датасета
-        #  БОЛЬШЕ НЕ НАДО, загружаем датасет из базы
-        # logger.debug(f"Загрузка датасета: {dataset_filename}")
-        # filepath = os.path.join(UPLOAD_FOLDER, dataset_filename)
-        # try:
-        #     df = pd.read_csv(filepath)
-        # except FileNotFoundError as e:
-        db = SessionLocal()
-        dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-
-        if dataset is None:
-            logger.error(f"Dataset with id {dataset_id} not found")
-            self.update_state(
-                state=states.FAILURE,
-                meta={
-                    'exc_type': "ValueError",
-                    'exc_message': f"Dataset with id {dataset_id} not found",
-                    'exc_traceback': ""  # No traceback since it's a data issue
-                }
-            )
-            raise Ignore()
-        filepath = os.path.join(UPLOAD_FOLDER, dataset.filename)
+        logger.debug(f"Загрузка датасета: {dataset_filename}")
+        filepath = os.path.join(UPLOAD_FOLDER, dataset_filename)
         try:
-
             df = pd.read_csv(filepath)
-        except Exception as e:
-
+        except FileNotFoundError as e:
             logger.error(f"Ошибка загрузки датасета: {e}")
             exc_info = traceback.format_exc()
 
@@ -227,9 +197,6 @@ def train_model_task(self, dataset_id: str, target_column: str,  # dataset_filen
                 }
             )
             raise Ignore()
-
-
-
         logger.debug(f"Проверка целевой колонки: {target_column}")
         if target_column not in df.columns:
             logger.error(f"Целевая колонка отсутствует в датасете: {target_column}")
@@ -242,7 +209,7 @@ def train_model_task(self, dataset_id: str, target_column: str,  # dataset_filen
                     'exc_traceback': exc_info
                 }
             )
-            db.close() # Закрываем сессию
+
             raise Ignore()
 
         X = df.drop(target_column, axis=1)
@@ -275,7 +242,6 @@ def train_model_task(self, dataset_id: str, target_column: str,  # dataset_filen
                     'exc_traceback': exc_info
                 }
             )
-            db.close()
             raise Ignore()
 
         logger.debug("Обучение модели...")
@@ -297,36 +263,29 @@ def train_model_task(self, dataset_id: str, target_column: str,  # dataset_filen
 
         # Сохранение в БД
         logger.debug("Сохранение в БД...")
-        # with SessionLocal() as db:  <- Вот тут using context manager использовать не надо.
-        # Мы уже находимся в контексте сессии, открытой ранее!
-        db_model = DBModel(
-            id=model_id,
-            model_type=model_params_obj.model_type,
-            params=model_params_obj.params,
-            metrics=metrics,
-            train_settings=train_settings,
-            target_column=target_column,
-            # dataset_filename=dataset_filename, <-  УДАЛЯЕМ
-            dataset_id = dataset_id, # Сохраняем id
-            model_data=model_data  # Сохраняем бинарные данные
-        )
-        db.add(db_model)
-        db.commit()
-        # db.refresh(db_model) #<-  Обновляем объект, чтобы получить все данные
-        # db.refresh(dataset)  #<-  Обновляем объект, чтобы получить все данные
-        result = {
-            'id': db_model.id,
-            'model_type': db_model.model_type,
-            'params': db_model.params,
-            'metrics': db_model.metrics,
-            'train_settings': db_model.train_settings,
-            'target_column': db_model.target_column,
-            # 'dataset_filename': db_model.dataset_filename, <-  УДАЛЯЕМ
-            'dataset_id': db_model.dataset_id
-        }
-
+        with SessionLocal() as db:
+            db_model = DBModel(
+                id=model_id,
+                model_type=model_params_obj.model_type,
+                params=model_params_obj.params,
+                metrics=metrics,
+                train_settings=train_settings,
+                target_column=target_column,
+                dataset_filename=dataset_filename,
+                model_data=model_data  # Сохраняем бинарные данные
+            )
+            db.add(db_model)
+            db.commit()
+            result = {
+                'id': db_model.id,
+                'model_type': db_model.model_type,
+                'params': db_model.params,
+                'metrics': db_model.metrics,
+                'train_settings': db_model.train_settings,
+                'target_column': db_model.target_column,
+                'dataset_filename': db_model.dataset_filename,
+            }
         logger.debug("Сохранение в БД завершено.")
-        db.close()
         return result
 
     except Exception as e:
@@ -341,8 +300,6 @@ def train_model_task(self, dataset_id: str, target_column: str,  # dataset_filen
                 'exc_traceback': exc_info,
             }
         )
-        if 'db' in locals() and db:
-            db.close()
         raise Ignore()
 
 
@@ -423,55 +380,55 @@ class InferenceProcess:
 
 
 inference_processes: Dict[str, InferenceProcess] = {}
+
+
 # --- API Endpoints ---
 
 
-@app.post("/upload_dataset/", response_model=DatasetResponse) #  Добавляем response_model
+@app.post("/upload_dataset/")
 async def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    logger.info(f"Received file: {file.filename}")
+    logger.info(f"File content type {file.content_type}")
     try:
         if file.content_type != "text/csv":
-            raise HTTPException(status_code=400, detail="Invalid file type. Must be CSV.")
-        # Читаем в память
+            raise HTTPException(
+                status_code=400, detail="Invalid file type.  Must be CSV.")
+
         contents = await file.read()
-
         df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        # Generate unique filename using UUID + original filename
+        filename = f"{uuid.uuid4()}_{file.filename}"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
 
-        #  Генерируем "безопасное" имя файла
-        original_filename, _ = os.path.splitext(file.filename)
-        safe_filename = slugify(original_filename)
-        unique_filename = f"{safe_filename}_{uuid.uuid4()}.csv"
-        filepath = os.path.join(UPLOAD_FOLDER, unique_filename)
-		# Сохраняем
+        # Check for duplicate filenames
+        existing_dataset = db.query(Dataset).filter(Dataset.filename == filename).first()
+        if existing_dataset:
+            raise HTTPException(status_code=409, detail="File with this name already exists.")
+
+
         with open(filepath, "wb") as f:
             f.write(contents)
 
-		# Создаем запись Dataset в базе данных
-        dataset = Dataset(
-            id=str(uuid.uuid4()),  # Генерируем UUID
-            original_filename=file.filename,  # Оригинальное имя файла
-            filename=unique_filename  # Уникальное имя в хранилище
-			)
-        db.add(dataset)
+        # Store dataset info in the database
+        new_dataset = Dataset(filename=filename, columns=df.columns.tolist())
+        db.add(new_dataset)
         db.commit()
-        db.refresh(dataset) # Обновляем объект
+        db.refresh(new_dataset)
 
-        return dataset  # Возвращаем созданный объект Dataset
+        return {"filename": filename, "columns": df.columns.tolist(), "id": new_dataset.id}
+    except HTTPException as e:
+      raise e
     except Exception as e:
-        #  Если ошибка, то удаляем
-        if 'filepath' in locals() and os.path.exists(filepath): # Проверка что файл был создан
-            os.remove(filepath)
-        db.rollback() # Откатываем транзакцию
+        logger.exception("Error uploading dataset")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/train/")
 async def train_model(
-        # dataset_filename: str = Form(...), <-  УДАЛЯЕМ
-        dataset_id: str = Form(...),  # Добавляем dataset_id
+        dataset_filename: str = Form(...),
         target_column: str = Form(...),
         train_settings: str = Form(...),
         model_params: str = Form(...),
-        # db: Session = Depends(get_db)  # <- Celery task не может принимать Depends
 ):
     try:
         train_settings_dict = json.loads(train_settings)
@@ -487,9 +444,7 @@ async def train_model(
         raise HTTPException(status_code=400, detail=str(e))
 
     task = train_model_task.delay(
-        # dataset_filename, target_column, train_settings_dict, model_params_dict) <-  УДАЛЯЕМ
-        dataset_id, target_column, train_settings_dict, model_params_dict
-    ) # dataset_id
+        dataset_filename, target_column, train_settings_dict, model_params_dict)
     return {"task_id": task.id}
 
 
@@ -518,12 +473,11 @@ async def get_train_status(task_id: str):
     return result
 
 
-@app.get("/trained_models/", response_model=List[TrainedModel])  # Указываем response_model!
+@app.get("/trained_models/", response_model=List[TrainedModel])
 async def get_trained_models(db: Session = Depends(get_db)):
     db_models = db.query(DBModel).all()
     # Convert to Pydantic models, *excluding* model_data.
-    # return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_data'}) for db_model in db_models]
-    return db_models
+    return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_data'}) for db_model in db_models]
 
 
 @app.get("/features/{model_id}", response_model=List[str])
@@ -532,24 +486,14 @@ async def get_model_features(model_id: str, db: Session = Depends(get_db)):
     if not db_model:
         raise HTTPException(status_code=404, detail="Model not found")
 
-    # dataset_path = os.path.join(UPLOAD_FOLDER, db_model.dataset_filename) <-  УДАЛЯЕМ
-    # try:
-    #     df = pd.read_csv(dataset_path)
-    #     feature_names = df.drop(
-    #         columns=[db_model.target_column]).columns.tolist()
-    #     return feature_names
-    # except FileNotFoundError:
-    #     raise HTTPException(status_code=404, detail="Dataset file not found")
-
-    #  Загружаем датасет и получаем фичи:
-    dataset_path = os.path.join(UPLOAD_FOLDER, db_model.dataset.filename)
+    dataset_path = os.path.join(UPLOAD_FOLDER, db_model.dataset_filename)
     try:
         df = pd.read_csv(dataset_path)
+        feature_names = df.drop(
+            columns=[db_model.target_column]).columns.tolist()
+        return feature_names
     except FileNotFoundError:
-        db.close()
         raise HTTPException(status_code=404, detail="Dataset file not found")
-    feature_names = df.drop(columns=[db_model.target_column]).columns.tolist()
-    return feature_names
 
 
 @app.get("/download_dataset/{filename}")
@@ -565,6 +509,49 @@ async def download_dataset(filename: str):
         "Content-Disposition": f"attachment; filename={filename}"
     })
 
+@app.get("/datasets/", response_model=List[DatasetModel])
+async def list_datasets(db: Session = Depends(get_db)):
+    """Lists all uploaded datasets."""
+    datasets = db.query(Dataset).all()
+    return datasets
+
+@app.get("/dataset/{dataset_id}", response_model=DatasetModel)
+async def get_dataset(dataset_id: str, db: Session = Depends(get_db)):
+    """Retrieves details of a specific dataset by ID."""
+    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return dataset
+
+
+@app.delete("/dataset/{dataset_id}")
+async def delete_dataset(dataset_id: str, db: Session = Depends(get_db)):
+    """Deletes a dataset from the database and the filesystem."""
+    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    # Delete associated trained models first (cascading delete)
+    db.query(DBModel).filter(DBModel.dataset_filename == dataset.filename).delete()
+
+
+    # Delete the dataset file
+    filepath = os.path.join(UPLOAD_FOLDER, dataset.filename)
+    try:
+        os.remove(filepath)
+    except FileNotFoundError:
+        pass  # File might have been deleted already
+    except Exception as e:
+        logger.exception(f"Error deleting file {filepath}")
+        db.rollback()  # rollback incase some models where deleted.
+        raise HTTPException(status_code=500, detail=f"Error deleting file: {e}")
+
+    # Delete the dataset record from the database
+    db.delete(dataset)
+    db.commit()
+    return {"message": f"Dataset '{dataset.filename}' deleted"}
+
+
 
 @app.post("/start_inference/{model_id}")
 async def start_inference_endpoint(model_id: str, db: Session = Depends(get_db)):
@@ -574,7 +561,10 @@ async def start_inference_endpoint(model_id: str, db: Session = Depends(get_db))
     if model_id in inference_processes and inference_processes[model_id].process.is_alive():
         return {
             "message": "Inference process already running",
-            "status": "running"
+            "status": "running",
+            "model_id": model_id,
+            "upload_url": f"http://localhost:8000/predict/{model_id}",
+            "json_url": "See docs on http://localhost:8000/docs#/default/predict_endpoint_predict__model_id__post"
         }
 
     db_model = db.query(DBModel).filter(DBModel.id == model_id).first()
@@ -662,29 +652,4 @@ async def inference_status_endpoint(model_id: str):
         return {"status": "running"}
 
 
-@app.get("/datasets/", response_model=List[DatasetResponse])
-async def get_datasets(db: Session = Depends(get_db)):
-    """Получает список всех загруженных датасетов."""
-    datasets = db.query(Dataset).all()
-    return datasets
-
-@app.delete("/datasets/{dataset_id}")
-async def delete_dataset(dataset_id: str, db: Session = Depends(get_db)):
-    """Удаляет датасет и связанные с ним модели."""
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset:
-        raise HTTPException(status_code=404, detail="Dataset not found")
-
-    # Удаляем связанные модели (используем каскадное удаление, если настроено, иначе вручную)
-    db.query(DBModel).filter(DBModel.dataset_id == dataset_id).delete()
-
-     # Удаляем файл датасета
-    filepath = os.path.join(UPLOAD_FOLDER, dataset.filename)
-    if os.path.exists(filepath):
-        os.remove(filepath)
-    db.delete(dataset)
-    db.commit()
-    return {"message": f"Dataset {dataset_id} and associated models deleted"}
-
 Base.metadata.create_all(bind=engine)
-
