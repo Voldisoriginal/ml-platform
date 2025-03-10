@@ -1,75 +1,77 @@
 <template>
   <div>
     <h2>Trained Models</h2>
+
+    <!-- Search and Filter Inputs -->
+    <div class="filters">
+      <div>
+        <label for="search">Search:</label>
+        <input type="text" id="search" v-model="searchQuery" placeholder="Search by ID, dataset, or target">
+      </div>
+
+      <div>
+        <label for="model-type">Model Type:</label>
+        <select id="model-type" v-model="selectedModelType">
+          <option value="">All</option>
+          <option value="LinearRegression">Linear Regression</option>
+          <option value="DecisionTreeRegressor">Decision Tree Regressor</option>
+          <!-- Add other model types here -->
+        </select>
+      </div>
+
+      <div>
+        <label for="dataset-filter"> Dataset:</label>
+        <input type="text" id="dataset-filter" v-model="selectedDatasetFilename" placeholder="Filter by dataset">
+      </div>
+
+      <div>
+        <label for="sort-by">Sort By:</label>
+        <select id="sort-by" v-model="selectedSortBy">
+          <option value="start_time">Start Time</option>
+          <option value="r2_score">R2 Score</option>
+          <option value="mse">MSE</option>
+          <!-- Add other sort options here -->
+        </select>
+      </div>
+      <div>
+        <label for="sort-order">Sort Order:</label>
+        <select id="sort-order" v-model="selectedSortOrder">
+          <option value="desc">Descending</option>
+          <option value="asc">Ascending</option>
+        </select>
+      </div>
+    </div>
     <div v-if="models.length === 0">No trained models yet.</div>
-    <div v-else class="model-cards">
-      <div v-for="model in models" :key="model.id" class="model-card" @click="showModelDetails(model)">
-        <div class="model-card-header">
-          <!-- Название датасета (если есть) или ID -->
-          <h3>{{ formatFilename(model.dataset_filename) }}</h3>  <!-- Use the formatting method -->
-          <p>Model Type: {{ model.model_type }}</p>
-        </div>
-        <div class="model-card-metrics">
-          <!-- Краткий вывод метрик -->
-          <p v-if="model.metrics && model.metrics.r2_score">R² Score: {{ model.metrics.r2_score.toFixed(4) }}</p>
-          <p v-if="model.metrics && model.metrics.mse">MSE: {{ model.metrics.mse.toFixed(4) }}</p>
-        </div>
-      </div>
-    </div>
-
-    <!-- Модальное окно с деталями модели -->
-    <div v-if="selectedModel" class="modal-overlay">
-      <div class="modal">
-        <div class="modal-header">
-          <h2>Model Details</h2>
-          <button @click="closeModal">Close</button>
-        </div>
-        <div class="modal-body">
-          <p><strong>ID:</strong> {{ selectedModel.id }}</p>
-          <p><strong>Dataset:</strong> {{ formatFilename(selectedModel.dataset_filename) }}</p> <!-- Use here too -->
-          <p>
-            <strong>Download Dataset:</strong>
-            <a :href="getDatasetDownloadLink(selectedModel.dataset_filename)" download>
-              Download
-            </a>
-          </p>
-          <p><strong>Target Column:</strong> {{ selectedModel.target_column }}</p>
-          <p><strong>Model Type:</strong> {{ selectedModel.model_type }}</p>
-
-          <!-- Параметры обучения -->
-          <div v-if="selectedModel.train_settings">
-            <p><strong>Train Settings:</strong></p>
-            <ul>
-              <li>Train Size: {{ selectedModel.train_settings.train_size }}</li>
-              <li>Random State: {{ selectedModel.train_settings.random_state }}</li>
-            </ul>
-          </div>
-
-          <!-- Параметры модели-->
-          <div v-if="selectedModel.params && Object.keys(selectedModel.params).length > 0">
-            <p><strong>Model Parameters:</strong></p>
-            <ul>
-              <li v-for="(value, key) in selectedModel.params" :key="key">
-                {{ key }}: {{ value }}
-              </li>
-            </ul>
-          </div>
-          <div v-else> Parameters: No parameters</div>
-
-          <!-- Метрики-->
-          <div v-if="selectedModel.metrics">
-            <p><strong>Metrics:</strong></p>
-            <ul>
-              <li v-for="(value, key) in selectedModel.metrics" :key="key">
-                {{ key }}: {{ value.toFixed(4) }}
-              </li>
-            </ul>
-
-          </div>
-          <button @click="selectForInference">Select for Inference</button>
-        </div>
-      </div>
-    </div>
+    <table v-else>
+        <thead>
+          <tr>
+            <th>Model ID</th>
+            <th>Dataset</th>
+            <th>Target Column</th>
+            <th>Model Type</th>
+            <th>Metrics</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+      <tbody>
+          <tr v-for="model in filteredModels" :key="model.id" @click="showModelDetails(model)">
+            <td>{{ model.id }}</td>
+            <td>{{ formatFilename(model.dataset_filename) }}</td>
+            <td>{{ model.target_column }}</td>
+            <td>{{ model.model_type }}</td>
+            <td>
+              <ul>
+                <li v-for="(value, key) in model.metrics" :key="key">
+                  {{ key }}: {{ value.toFixed(4) }}
+                </li>
+              </ul>
+            </td>
+              <td>
+                  <button @click.stop="selectForInference(model.id)">Select for Inference</button>
+              </td>
+          </tr>
+        </tbody>
+      </table>
   </div>
 </template>
 
@@ -87,94 +89,113 @@ export default {
   },
   data() {
     return {
-      selectedModel: null,
-
+      searchQuery: '',
+      selectedSortBy: 'start_time',
+      selectedSortOrder: 'desc',
+      selectedModelType: '',
+      selectedDatasetFilename: '',
     };
   },
   methods: {
-    showModelDetails(model) {
-      this.selectedModel = model;
-    },
-    closeModal() {
-      this.selectedModel = null;
-    },
-    selectForInference() {
-      this.$emit('model-selected-for-inference', this.selectedModel.id);
-      this.closeModal(); // Закрываем модальное окно после выбора
+    selectForInference(modelId) {
+      this.$emit('model-selected-for-inference', modelId);
     },
     getDatasetDownloadLink(filename) {
       return `${API_BASE_URL}/download_dataset/${filename}`;
     },
-    // Method to format the filename
     formatFilename(filename) {
       if (!filename) {
-        return ''; // Or some default text
+        return '';
       }
-      // Split the filename by the underscore.
       const parts = filename.split('_');
-      // If there's more than one part, remove the UUID (the first part).
       if (parts.length > 1) {
-          return parts.slice(1).join('_'); // Join the remaining parts.
+        return parts.slice(1).join('_');
       }
-      // If there's only one part (no underscore), return the original filename.
       return filename;
-    }
+    },
+      showModelDetails(model) {
+          this.$emit('show-model-details', model); // Emit event to parent
+      },
+  },
+    computed: {
+    filteredModels() {
+      // Apply filtering and sorting logic here, if needed, otherwise return this.models
+      let filtered = [...this.models];
+
+       if (this.searchQuery) {
+            const query = this.searchQuery.toLowerCase();
+            filtered = filtered.filter(model =>
+                model.id.toLowerCase().includes(query) ||
+                (model.dataset_filename && model.dataset_filename.toLowerCase().includes(query)) ||
+                (model.target_column && model.target_column.toLowerCase().includes(query))
+            );
+        }
+
+
+        // Sorting logic
+        if (this.selectedSortBy) {
+            filtered.sort((a, b) => {
+                const order = this.selectedSortOrder === 'asc' ? 1 : -1;
+                 if (this.selectedSortBy === 'r2_score' || this.selectedSortBy === 'mse') {
+                    // Special handling for metrics, check they exist
+                    const valA = a.metrics && a.metrics[this.selectedSortBy] !== undefined ? a.metrics[this.selectedSortBy] : (this.selectedSortOrder === 'asc' ? -Infinity : Infinity);
+                    const valB = b.metrics && b.metrics[this.selectedSortBy] !== undefined ? b.metrics[this.selectedSortBy] : (this.selectedSortOrder === 'asc' ? -Infinity : Infinity);
+
+                    return (valA - valB) * order;
+                }
+                else if (this.selectedSortBy === 'start_time')
+                {
+                    return (new Date(a.start_time) - new Date(b.start_time)) * order;
+                }
+                else {
+                    // Generic string comparison, check that values are defined
+                    const valA = a[this.selectedSortBy] ? a[this.selectedSortBy].toString().toLowerCase() : '';
+                    const valB = b[this.selectedSortBy] ? b[this.selectedSortBy].toString().toLowerCase() : '';                    return valA.localeCompare(valB) * order;
+                }
+
+            });
+        }
+
+
+
+      return filtered;
+    },
   },
 };
 </script>
 
 <style scoped>
-.model-cards {
+/* Filters */
+.filters {
   display: flex;
   flex-wrap: wrap;
-  gap: 20px;
-}
-
-.model-card {
-  border: 1px solid #ddd;
-  padding: 15px;
-  border-radius: 5px;
-  width: 200px; /* Или другая ширина */
-  cursor: pointer;
-  transition: background-color 0.2s;
-}
-
-.model-card:hover {
-  background-color: #f0f0f0;
-}
-.model-card-header{
-
-}
-.model-card-metrics{
-
-}
-/* Модальное окно */
-.modal-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  background-color: rgba(0, 0, 0, 0.5);
-  display: flex;
+  gap: 10px;
+  margin-bottom: 20px;
   justify-content: center;
-  align-items: center;
 }
 
-.modal {
-  background-color: white;
-  padding: 20px;
-  border-radius: 5px;
-  width: 80%; /* Можно настроить */
-  max-width: 600px; /* Можно настроить */
+.filters > div {
+  /*margin: 5px 5px 5px 5px;*/
 }
-.modal-header{
-    display:flex;
-    justify-content: space-between;
 
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 20px;
 }
-.modal-body{
 
+th,
+td {
+  border: 1px solid #ddd;
+  padding: 8px;
+  text-align: left;
 }
-/* Стили для кнопок и заголовков (на ваше усмотрение) */
+
+th {
+  background-color: #f2f2f2;
+}
+tr{
+    cursor: pointer;
+}
+
 </style>

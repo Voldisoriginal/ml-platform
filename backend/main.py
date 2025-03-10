@@ -50,6 +50,7 @@ class DBModel(Base):  # Таблица для хранения моделей
     target_column = Column(String)
     dataset_filename = Column(String)  # filename
     model_data = Column(LargeBinary)
+    start_time = Column(DateTime, default=datetime.utcnow)  # Добавлено: время начала обучения
 
 
 class Dataset(Base):
@@ -63,6 +64,8 @@ class Dataset(Base):
     def __repr__(self):
         return f"<Dataset(id={self.id}, filename={self.filename}, upload_date={self.upload_date})>"
 
+# !!! Создание таблиц !!!
+Base.metadata.create_all(bind=engine)
 
 # --- Celery Configuration ---
 CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", 'redis://redis:6379/0')
@@ -126,6 +129,7 @@ class TrainedModel(BaseModel):
     train_settings: TrainSettings
     target_column: str
     dataset_filename: str
+    start_time: datetime # Добавлено
 
 class DatasetModel(BaseModel):
     id: str
@@ -136,6 +140,14 @@ class DatasetModel(BaseModel):
     class Config:
         orm_mode = True
 
+class RunningModel(BaseModel): # Добавлено для списка запущенных моделей
+    model_id: str
+    dataset_filename: str
+    target_column: str
+    model_type: str
+    metrics: Dict[str, float]
+    status: str
+    api_url: str
 
 # --- FastAPI App ---
 app = FastAPI()
@@ -256,6 +268,7 @@ def train_model_task(self, dataset_filename: str, target_column: str,
         }
         logger.debug(f"Метрики: {metrics}")
         model_id = str(uuid.uuid4())
+        start_time = datetime.utcnow() #Фиксируем время начала
 
         buffer = io.BytesIO()
         joblib.dump(model, buffer)
@@ -272,7 +285,8 @@ def train_model_task(self, dataset_filename: str, target_column: str,
                 train_settings=train_settings,
                 target_column=target_column,
                 dataset_filename=dataset_filename,
-                model_data=model_data  # Сохраняем бинарные данные
+                model_data=model_data,  # Сохраняем бинарные данные
+                start_time = start_time
             )
             db.add(db_model)
             db.commit()
@@ -284,6 +298,7 @@ def train_model_task(self, dataset_filename: str, target_column: str,
                 'train_settings': db_model.train_settings,
                 'target_column': db_model.target_column,
                 'dataset_filename': db_model.dataset_filename,
+                'start_time': db_model.start_time
             }
         logger.debug("Сохранение в БД завершено.")
         return result
@@ -479,6 +494,59 @@ async def get_trained_models(db: Session = Depends(get_db)):
     # Convert to Pydantic models, *excluding* model_data.
     return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_data'}) for db_model in db_models]
 
+@app.get("/trained_models/search_sort", response_model=List[TrainedModel])
+async def search_sort_trained_models(
+    db: Session = Depends(get_db),
+    search_query: Optional[str] = None,
+    sort_by: Optional[str] = "start_time",  # Default sort by start_time
+    sort_order: Optional[str] = "desc",  # Default sort order (asc/desc)
+    model_type: Optional[str] = None,      # Filter by model type
+    dataset_filename: Optional[str] = None # Filter by dataset filename
+):
+    query = db.query(DBModel)
+
+    # Filtering
+    if search_query:
+        query = query.filter(
+            (DBModel.id.ilike(f"%{search_query}%")) |
+            (DBModel.dataset_filename.ilike(f"%{search_query}%")) |
+            (DBModel.target_column.ilike(f"%{search_query}%"))
+        )
+    if model_type:
+        query = query.filter(DBModel.model_type == model_type)
+    if dataset_filename:
+        query = query.filter(DBModel.dataset_filename.ilike(f"%{dataset_filename}%"))
+
+    # Sorting
+    if sort_by:
+        if sort_by == "start_time":
+            sort_column = DBModel.start_time
+        elif sort_by =="r2_score" and sort_order:
+             if sort_order == "asc":
+                 query = query.order_by(sqlalchemy.asc(DBModel.metrics['r2_score'].cast(Float)))
+             elif sort_order == "desc":
+                 query = query.order_by(sqlalchemy.desc(DBModel.metrics['r2_score'].cast(Float)))
+             return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_data'}) for db_model in query.all()]
+        elif sort_by == "mse" and sort_order:
+            if sort_order == "asc":
+                query = query.order_by(sqlalchemy.asc(DBModel.metrics['mse'].cast(Float)))
+            elif sort_order == "desc":
+                query = query.order_by(sqlalchemy.desc(DBModel.metrics['mse'].cast(Float)))
+            return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_data'}) for db_model in query.all()]
+
+        else:  # Add more sorting options as needed
+            sort_column = getattr(DBModel, sort_by, None)
+
+
+        if sort_column is not None:
+            if sort_order == "asc":
+                query = query.order_by(sort_column.asc())
+            elif sort_order == "desc":
+                query = query.order_by(sort_column.desc())
+
+    db_models = query.all()
+    return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_data'}) for db_model in db_models]
+
 
 @app.get("/features/{model_id}", response_model=List[str])
 async def get_model_features(model_id: str, db: Session = Depends(get_db)):
@@ -652,4 +720,25 @@ async def inference_status_endpoint(model_id: str):
         return {"status": "running"}
 
 
-Base.metadata.create_all(bind=engine)
+@app.get("/running_models/", response_model=List[RunningModel]) # Новый эндпоинт
+async def get_running_models():
+    """Returns a list of currently running inference models."""
+    running_models_list = []
+    for model_id, inference_process in inference_processes.items():
+        if inference_process.process and inference_process.process.is_alive():
+            # Достаём информацию о модели из БД, т.к.  inference_process хранит только бинарник
+            with SessionLocal() as db:
+                db_model = db.query(DBModel).filter(DBModel.id == model_id).first()
+                if db_model:  # Защита от устаревших
+                    running_models_list.append(
+                        RunningModel(
+                            model_id=model_id,
+                            dataset_filename=db_model.dataset_filename,
+                            target_column=db_model.target_column,
+                            model_type=db_model.model_type,
+                            metrics=db_model.metrics,
+                            status="running",
+                            api_url=f"http://localhost:8000/predict/{model_id}",
+                        )
+                    )
+    return running_models_list

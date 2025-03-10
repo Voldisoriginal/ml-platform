@@ -7,8 +7,7 @@
         <button v-if="isFormComplete" @click="trainModel" :disabled="isTraining">Train Model</button>
         <TrainingProgress v-if="isTraining || trainingResult" :is-training="isTraining" :result="trainingResult"
             :taskId="taskId" />
-        <!-- Используем обновленный компонент TrainedModelsList -->
-        <TrainedModelsList :models="trainedModels" @model-selected-for-inference="startInference" />
+        <!-- Удалена TrainedModelsList отсюда -->
 
         <ModelInference v-if="selectedModelForInference" :modelId="selectedModelForInference"
             @close-inference="selectedModelForInference = null" :featureNames="featureNames" />
@@ -20,7 +19,7 @@
     import TrainSettings from '@/components/TrainSettings.vue';
     import ModelSelection from '@/components/ModelSelection.vue';
     import TrainingProgress from '@/components/TrainingProgress.vue';
-    import TrainedModelsList from '@/components/TrainedModelsList.vue'; // Обновленный компонент
+    // import TrainedModelsList from '@/components/TrainedModelsList.vue'; // Удалено
     import ModelInference from '@/components/ModelInference.vue';
     import axios from 'axios';
 
@@ -34,7 +33,7 @@
             TrainSettings,
             ModelSelection,
             TrainingProgress,
-            TrainedModelsList, // Обновленный
+            // TrainedModelsList, // Удалено
             ModelInference
         },
         data() {
@@ -55,7 +54,7 @@
                 ],
                 isTraining: false,
                 trainingResult: null, // Результат обучения (метрики и т.д.)
-                trainedModels: [], // Список обученных моделей
+                // trainedModels: [], // Удалено
                 selectedModelForInference: null, // ID модели для инференса
                 featureNames: [], // Названия признаков для выбранной модели
                 taskId: null,  // ID задачи Celery
@@ -115,14 +114,14 @@
                     // this.isTraining = false; // НЕ ставим false сразу!
                 }
             },
-            async fetchTrainedModels() {
-                try {
-                    const response = await axios.get(`${API_BASE_URL}/trained_models/`);
-                    this.trainedModels = response.data;
-                } catch (error) {
-                    console.error("Error fetching trained models:", error);
-                }
-            },
+            // async fetchTrainedModels() { //Удалено
+            //     try {
+            //         const response = await axios.get(`${API_BASE_URL}/trained_models/`);
+            //         this.trainedModels = response.data;
+            //     } catch (error) {
+            //         console.error("Error fetching trained models:", error);
+            //     }
+            // },
             async startInference(modelId) {
                 this.selectedModelForInference = modelId;
                 // Получаем названия признаков:
@@ -135,9 +134,9 @@
                 }
             },
         },
-        async created() {
-            await this.fetchTrainedModels();
-        }
+        // async created() { //Удалено
+        //     await this.fetchTrainedModels();
+        // }
 
     };
 </script>
