@@ -162,11 +162,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- File Storage ---
-UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-
 # --- Database Helpers ---
 def get_db():
     db = SessionLocal()
@@ -193,9 +188,27 @@ def train_model_task(self, dataset_filename: str, target_column: str,
     try:
         # 1. Загрузка датасета
         logger.debug(f"Загрузка датасета: {dataset_filename}")
-        filepath = os.path.join(UPLOAD_FOLDER, dataset_filename)
+        # filepath = os.path.join(UPLOAD_FOLDER, dataset_filename) # No need to use UPLOAD_FOLDER, dataset saved below
         try:
-            df = pd.read_csv(filepath)
+           with SessionLocal() as db:
+              dataset = db.query(Dataset).filter(Dataset.filename == dataset_filename).first()
+
+           if dataset:
+              df = pd.read_csv(io.StringIO(open(dataset.filename, 'r', encoding='utf-8').read())) # Read directly without UPLOAD_FOLDER
+           else:
+            logger.error(f"Ошибка загрузки датасета: File not found")
+            exc_info = traceback.format_exc()
+            self.update_state(
+                state=states.FAILURE,
+                meta={
+                    'exc_type':  "FileNotFoundError",
+                    'exc_message': str("File not found"),
+                    'exc_traceback': exc_info,
+                }
+            )
+            raise Ignore()
+
+            # df = pd.read_csv(filepath) # No need to use filepath
         except FileNotFoundError as e:
             logger.error(f"Ошибка загрузки датасета: {e}")
             exc_info = traceback.format_exc()
@@ -413,7 +426,7 @@ async def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get
         df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
         # Generate unique filename using UUID + original filename
         filename = f"{uuid.uuid4()}_{file.filename}"
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        # filepath = os.path.join(UPLOAD_FOLDER, filename) # No need UPLOAD_FOLDER
 
         # Check for duplicate filenames
         existing_dataset = db.query(Dataset).filter(Dataset.filename == filename).first()
@@ -421,7 +434,7 @@ async def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get
             raise HTTPException(status_code=409, detail="File with this name already exists.")
 
 
-        with open(filepath, "wb") as f:
+        with open(filename, "wb") as f: # save file without UPLOAD_FOLDER
             f.write(contents)
 
         # Store dataset info in the database
@@ -554,9 +567,10 @@ async def get_model_features(model_id: str, db: Session = Depends(get_db)):
     if not db_model:
         raise HTTPException(status_code=404, detail="Model not found")
 
-    dataset_path = os.path.join(UPLOAD_FOLDER, db_model.dataset_filename)
+    # dataset_path = os.path.join(UPLOAD_FOLDER, db_model.dataset_filename) # No UPLOAD_FOLDER
     try:
-        df = pd.read_csv(dataset_path)
+        # df = pd.read_csv(dataset_path) # read directly
+        df = pd.read_csv(io.StringIO(open(db_model.dataset_filename, 'r', encoding='utf-8').read()))
         feature_names = df.drop(
             columns=[db_model.target_column]).columns.tolist()
         return feature_names
@@ -566,11 +580,11 @@ async def get_model_features(model_id: str, db: Session = Depends(get_db)):
 
 @app.get("/download_dataset/{filename}")
 async def download_dataset(filename: str):
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    if not os.path.exists(filepath):
+    # filepath = os.path.join(UPLOAD_FOLDER, filename) # No UPLOAD_FOLDER
+    if not os.path.exists(filename): # Check directly
         raise HTTPException(status_code=404, detail="File not found")
 
-    with open(filepath, "rb") as f:
+    with open(filename, "rb") as f: # Open directly
         content = f.read()
 
     return Response(content=content, media_type="text/csv", headers={
@@ -604,13 +618,13 @@ async def delete_dataset(dataset_id: str, db: Session = Depends(get_db)):
 
 
     # Delete the dataset file
-    filepath = os.path.join(UPLOAD_FOLDER, dataset.filename)
+    # filepath = os.path.join(UPLOAD_FOLDER, dataset.filename) # No UPLOAD_FOLDER
     try:
-        os.remove(filepath)
+        os.remove(dataset.filename) # Delete directly
     except FileNotFoundError:
         pass  # File might have been deleted already
     except Exception as e:
-        logger.exception(f"Error deleting file {filepath}")
+        logger.exception(f"Error deleting file {dataset.filename}")
         db.rollback()  # rollback incase some models where deleted.
         raise HTTPException(status_code=500, detail=f"Error deleting file: {e}")
 

@@ -1,7 +1,14 @@
 <template>
   <div>
     <h1>Trained Models</h1>
-    <TrainedModelsList :models="trainedModels" @model-selected-for-inference="startInference" @show-model-details="showModelDetails" />
+    <TrainedModelsList :models="trainedModels"
+                       :items-per-page="itemsPerPageOptions"
+                       @model-selected-for-inference="startInference"
+                       @show-model-details="showModelDetails"
+                       @fetch-models="fetchTrainedModels"
+                       ref="modelsList"
+
+    />
     <ModelInference v-if="selectedModelForInference" :modelId="selectedModelForInference"
                     @close-inference="selectedModelForInference = null" :featureNames="featureNames"/>
     <ModelDetailsModal v-if="selectedModel" :model="selectedModel" @close="selectedModel = null" />
@@ -28,35 +35,16 @@ export default {
       selectedModelForInference: null,
       featureNames: [],
       selectedModel: null, // Add this
+      itemsPerPageOptions: [5, 10, 20, 50], // Add more options if needed
     };
   },
   methods: {
     async fetchTrainedModels() {
       try {
-        let url = `${API_BASE_URL}/trained_models/search_sort`;
-        const queryParams = [];
+          let url = `${API_BASE_URL}/trained_models/search_sort`;
 
-        if (this.searchQuery) {
-          queryParams.push(`search_query=${this.searchQuery}`);
-        }
-        if (this.selectedSortBy) {
-          queryParams.push(`sort_by=${this.selectedSortBy}`);
-        }
-        if (this.selectedSortOrder) {
-          queryParams.push(`sort_order=${this.selectedSortOrder}`);
-        }
-        if (this.selectedModelType) {
-          queryParams.push(`model_type=${this.selectedModelType}`);
-        }
-        if (this.selectedDatasetFilename) {
-          queryParams.push(`dataset_filename=${this.selectedDatasetFilename}`);
-        }
-
-        if (queryParams.length > 0) {
-          url += `?${queryParams.join('&')}`;
-        }
-        const response = await axios.get(url);
-        this.trainedModels = response.data;
+          const response = await axios.get(url);
+          this.trainedModels = response.data;
       } catch (error) {
         console.error('Error fetching trained models:', error);
       }
@@ -74,27 +62,17 @@ export default {
     showModelDetails(model) {
       this.selectedModel = model;
     },
+      setItemsPerPage(value) {
+          if (this.$refs.modelsList)
+          {
+              this.$refs.modelsList.itemsPerPage = parseInt(value, 10)
+              this.$refs.modelsList.currentPage = 1;// Reset to the first page when the items per page changes
+
+          }
+      },
   },
   created() {
     this.fetchTrainedModels();
-  },
-  computed: {},
-  watch: {
-    searchQuery() {
-      this.fetchTrainedModels();
-    },
-    selectedSortBy() {
-      this.fetchTrainedModels();
-    },
-    selectedSortOrder() {
-      this.fetchTrainedModels();
-    },
-    selectedModelType() {
-      this.fetchTrainedModels();
-    },
-    selectedDatasetFilename() {
-      this.fetchTrainedModels();
-    },
   },
 };
 </script>
