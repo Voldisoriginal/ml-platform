@@ -13,3 +13,4 @@ python-slugify
 pydantic[email] # Для валидации email, если понадобится
 asyncpg # асинхронный драйвер
 SQLAlchemy
+Pillow

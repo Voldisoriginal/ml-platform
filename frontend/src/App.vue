@@ -16,12 +16,15 @@
 import { ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import Menubar from 'primevue/menubar'
+import Toast from 'primevue/toast';  // Import Toast
+
 
 const router = useRouter()
 const menuItems = ref([
   { label: 'Home', icon: 'pi pi-home', command: () => router.push('/') },
   { label: 'Trained Models', icon: 'pi pi-database', command: () => router.push('/trained-models') },
-  { label: 'Running Models', icon: 'pi pi-chart-line', command: () => router.push('/running-models') }
+  { label: 'Running Models', icon: 'pi pi-chart-line', command: () => router.push('/running-models') },
+  { label: 'Datasets', icon: 'pi pi-folder', command: () => router.push('/datasets') }, // Add Datasets route
 ])
 
 </script>
@@ -33,9 +36,9 @@ const menuItems = ref([
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-align: center;
-  /*color: #ffffff; /* Белый текст для контраста */
+  /*color: #ffffff;  Белый текст для контраста */
   min-height: 100vh; /* Занимаем всю высоту экрана */
-  /*background: linear-gradient(135deg, #29323c 0%, #485563 100%); /* Темно-синий градиент фона */
+  /*background: linear-gradient(135deg, #29323c 0%, #485563 100%);  Темно-синий градиент фона */
   display: flex;
   flex-direction: column;
 }

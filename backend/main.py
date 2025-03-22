@@ -1,13 +1,12 @@
 import traceback
 import logging
 import json
-import time
 import uuid
 import os
 import io
 import pandas as pd
 from typing import List, Dict, Optional, Union, Any
-from pydantic import BaseModel, validator, Field
+from pydantic import BaseModel, validator, Field, ValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Response
 import joblib
@@ -20,7 +19,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 import sqlalchemy
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy import create_engine, Column, Integer, String, Float, JSON, LargeBinary, DateTime
+from sqlalchemy import create_engine, Column, String, Float, JSON, LargeBinary, DateTime
 from datetime import datetime
 # Celery
 from celery import Celery, states
@@ -29,17 +28,25 @@ from celery.exceptions import Ignore
 import multiprocessing
 from multiprocessing import Process, Queue, Event
 
+# --- Directory Setup ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+
+# Create directories if they don't exist
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+
 # --- Database Configuration ---
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://user:password@db:5432/dbname")
-CURRENT_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)  # Важно для multiprocessing
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)  # Important for multiprocessing
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
 # --- Database Models ---
-class DBModel(Base):  # Таблица для хранения моделей
+class DBModel(Base):  # Table for storing models
     __tablename__ = "trained_models"
 
     id = Column(String, primary_key=True, index=True)
@@ -48,23 +55,29 @@ class DBModel(Base):  # Таблица для хранения моделей
     metrics = Column(JSON)
     train_settings = Column(JSON)
     target_column = Column(String)
-    dataset_filename = Column(String)  # filename
-    model_data = Column(LargeBinary)
-    start_time = Column(DateTime, default=datetime.utcnow)  # Добавлено: время начала обучения
+    dataset_filename = Column(String)
+    model_filename = Column(String)  # Store the model filename
+    start_time = Column(DateTime, default=datetime.utcnow)
 
 
 class Dataset(Base):
     __tablename__ = "datasets"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    filename = Column(String, unique=True, index=True)  # Add unique constraint
+    filename = Column(String, unique=True, index=True)
     upload_date = Column(DateTime, default=datetime.utcnow)
-    columns = Column(JSON)  # Store column names as JSON
+    columns = Column(JSON)
+    name = Column(String, nullable=True)
+    description = Column(String, nullable=True)
+    author = Column(String, nullable=True)
+    target_variable = Column(String, nullable=True)
+    image_filename = Column(String, nullable=True)
 
     def __repr__(self):
         return f"<Dataset(id={self.id}, filename={self.filename}, upload_date={self.upload_date})>"
 
-# !!! Создание таблиц !!!
+
+# Create tables
 Base.metadata.create_all(bind=engine)
 
 # --- Celery Configuration ---
@@ -108,12 +121,12 @@ class ModelParams(BaseModel):
             pass
         elif model_type == "DecisionTreeRegressor":
             if "max_depth" in value:
-                if not isinstance(value["max_depth"], int) or value["max_depth"] <= 0:  # type: ignore
+                if not isinstance(value["max_depth"], int) or value["max_depth"] <= 0:
                     raise ValueError("max_depth must be a positive integer")
             if 'min_samples_split' in value:
                 if (not isinstance(value['min_samples_split'], int) or value['min_samples_split'] <= 0) and (
                         not isinstance(value['min_samples_split'], float) or not 0 < value[
-                    'min_samples_split'] <= 1):  # type: ignore
+                    'min_samples_split'] <= 1):
                     raise ValueError(
                         "min_samples_split must be a positive integer or a float between 0 and 1")
         else:
@@ -129,18 +142,26 @@ class TrainedModel(BaseModel):
     train_settings: TrainSettings
     target_column: str
     dataset_filename: str
-    start_time: datetime # Добавлено
+    start_time: datetime
+
 
 class DatasetModel(BaseModel):
     id: str
     filename: str
     upload_date: datetime
     columns: List[str]
+    name: Optional[str] = None
+    description: Optional[str] = None
+    author: Optional[str] = None
+    target_variable: Optional[str] = None
+    imageUrl: Optional[str] = None
 
     class Config:
         orm_mode = True
+        from_attributes = True  # Add this line!
 
-class RunningModel(BaseModel): # Добавлено для списка запущенных моделей
+
+class RunningModel(BaseModel):
     model_id: str
     dataset_filename: str
     target_column: str
@@ -148,6 +169,7 @@ class RunningModel(BaseModel): # Добавлено для списка запу
     metrics: Dict[str, float]
     status: str
     api_url: str
+
 
 # --- FastAPI App ---
 app = FastAPI()
@@ -161,6 +183,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # --- Database Helpers ---
 def get_db():
@@ -186,31 +209,30 @@ logger.addHandler(handler)
 def train_model_task(self, dataset_filename: str, target_column: str,
                      train_settings: Dict, model_params: Dict):
     try:
-        # 1. Загрузка датасета
-        logger.debug(f"Загрузка датасета: {dataset_filename}")
-        # filepath = os.path.join(UPLOAD_FOLDER, dataset_filename) # No need to use UPLOAD_FOLDER, dataset saved below
+        # 1. Load dataset
+        logger.debug(f"Loading dataset: {dataset_filename}")
+        dataset_path = os.path.join(UPLOADS_DIR, dataset_filename)
         try:
-           with SessionLocal() as db:
-              dataset = db.query(Dataset).filter(Dataset.filename == dataset_filename).first()
+            with SessionLocal() as db:
+                dataset = db.query(Dataset).filter(Dataset.filename == dataset_filename).first()
 
-           if dataset:
-              df = pd.read_csv(io.StringIO(open(dataset.filename, 'r', encoding='utf-8').read())) # Read directly without UPLOAD_FOLDER
-           else:
-            logger.error(f"Ошибка загрузки датасета: File not found")
-            exc_info = traceback.format_exc()
-            self.update_state(
-                state=states.FAILURE,
-                meta={
-                    'exc_type':  "FileNotFoundError",
-                    'exc_message': str("File not found"),
-                    'exc_traceback': exc_info,
-                }
-            )
-            raise Ignore()
+            if dataset:
+                df = pd.read_csv(dataset_path)
+            else:
+                logger.error(f"Dataset loading error: File not found")
+                exc_info = traceback.format_exc()
+                self.update_state(
+                    state=states.FAILURE,
+                    meta={
+                        'exc_type': "FileNotFoundError",
+                        'exc_message': "File not found",
+                        'exc_traceback': exc_info,
+                    }
+                )
+                raise Ignore()
 
-            # df = pd.read_csv(filepath) # No need to use filepath
         except FileNotFoundError as e:
-            logger.error(f"Ошибка загрузки датасета: {e}")
+            logger.error(f"Dataset loading error: {e}")
             exc_info = traceback.format_exc()
 
             self.update_state(
@@ -222,9 +244,9 @@ def train_model_task(self, dataset_filename: str, target_column: str,
                 }
             )
             raise Ignore()
-        logger.debug(f"Проверка целевой колонки: {target_column}")
+        logger.debug(f"Checking target column: {target_column}")
         if target_column not in df.columns:
-            logger.error(f"Целевая колонка отсутствует в датасете: {target_column}")
+            logger.error(f"Target column missing in dataset: {target_column}")
             exc_info = traceback.format_exc()
             self.update_state(
                 state=states.FAILURE,
@@ -240,16 +262,16 @@ def train_model_task(self, dataset_filename: str, target_column: str,
         X = df.drop(target_column, axis=1)
         y = df[target_column]
 
-        # 2. Преобразование настроек обучения
-        logger.debug(f"Преобразование настроек обучения: {train_settings}")
+        # 2. Transform train settings
+        logger.debug(f"Transforming train settings: {train_settings}")
         train_settings_obj = TrainSettings(**train_settings)
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, train_size=train_settings_obj.train_size,
             random_state=train_settings_obj.random_state
         )
 
-        # 3. Обучение модели
-        logger.debug(f"Преобразование параметров модели: {model_params}")
+        # 3. Train model
+        logger.debug(f"Transforming model parameters: {model_params}")
         model_params_obj = ModelParams(**model_params)
         if model_params_obj.model_type == "LinearRegression":
             model = LinearRegression(**model_params_obj.params)
@@ -257,7 +279,7 @@ def train_model_task(self, dataset_filename: str, target_column: str,
             model = DecisionTreeRegressor(**model_params_obj.params)
         else:
             logger.error(
-                f"Неподдерживаемый тип модели: {model_params_obj.model_type}")
+                f"Unsupported model type: {model_params_obj.model_type}")
             exc_info = traceback.format_exc()
             self.update_state(
                 state=states.FAILURE,
@@ -269,26 +291,27 @@ def train_model_task(self, dataset_filename: str, target_column: str,
             )
             raise Ignore()
 
-        logger.debug("Обучение модели...")
+        logger.debug("Training model...")
         model.fit(X_train, y_train)
-        logger.debug("Обучение завершено.")
+        logger.debug("Training complete.")
 
-        # 4. Оценка модели
+        # 4. Evaluate model
         y_pred = model.predict(X_test)
         metrics = {
             "r2_score": r2_score(y_test, y_pred),
             "mse": mean_squared_error(y_test, y_pred)
         }
-        logger.debug(f"Метрики: {metrics}")
+        logger.debug(f"Metrics: {metrics}")
         model_id = str(uuid.uuid4())
-        start_time = datetime.utcnow() #Фиксируем время начала
+        start_time = datetime.utcnow()
 
-        buffer = io.BytesIO()
-        joblib.dump(model, buffer)
-        model_data = buffer.getvalue()
+        # Save the model to a file
+        model_filename = f"{model_id}.joblib"
+        model_path = os.path.join(MODELS_DIR, model_filename)
+        joblib.dump(model, model_path)
 
-        # Сохранение в БД
-        logger.debug("Сохранение в БД...")
+        # Save to database
+        logger.debug("Saving to database...")
         with SessionLocal() as db:
             db_model = DBModel(
                 id=model_id,
@@ -298,8 +321,8 @@ def train_model_task(self, dataset_filename: str, target_column: str,
                 train_settings=train_settings,
                 target_column=target_column,
                 dataset_filename=dataset_filename,
-                model_data=model_data,  # Сохраняем бинарные данные
-                start_time = start_time
+                model_filename=model_filename,
+                start_time=start_time
             )
             db.add(db_model)
             db.commit()
@@ -313,11 +336,11 @@ def train_model_task(self, dataset_filename: str, target_column: str,
                 'dataset_filename': db_model.dataset_filename,
                 'start_time': db_model.start_time
             }
-        logger.debug("Сохранение в БД завершено.")
+        logger.debug("Database save complete.")
         return result
 
     except Exception as e:
-        logger.exception("Произошла ошибка в задаче Celery:")
+        logger.exception("An error occurred in the Celery task:")
         exc_info = traceback.format_exc()
 
         self.update_state(
@@ -334,23 +357,23 @@ def train_model_task(self, dataset_filename: str, target_column: str,
 # --- Inference Process Management ---
 
 class InferenceProcess:
-    def __init__(self, model_id: str, model_data: bytes, result_queue: Queue):
+    def __init__(self, model_id: str, model_filename: str, result_queue: Queue):
         self.model_id = model_id
-        self.model_data = model_data
+        self.model_filename = model_filename
+        self.model_path = os.path.join(MODELS_DIR, self.model_filename)
         self.model: Optional[Any] = None
         self.process: Optional[Process] = None
         self.result_queue = result_queue
-        self.input_queue = Queue()  # Queue for input data
-        self.stop_event = Event()  # Use multiprocessing.Event
+        self.input_queue = Queue()
+        self.stop_event = Event()
 
     def _run(self):
         logger.info(f"Inference process started for model {self.model_id}")
         try:
-            buffer = io.BytesIO(self.model_data)
-            self.model = joblib.load(buffer)
+            self.model = joblib.load(self.model_path)
         except Exception as e:
             logger.exception(f"Error loading model in process {self.model_id}:")
-            self.result_queue.put({  # Put error on result queue
+            self.result_queue.put({
                 "model_id": self.model_id,
                 "error": str(e),
                 "predictions": None
@@ -359,7 +382,6 @@ class InferenceProcess:
 
         while not self.stop_event.is_set():
             try:
-                # Wait for data on the input queue with a timeout
                 data = self.input_queue.get(timeout=1)
                 if data is None:
                     continue
@@ -370,9 +392,9 @@ class InferenceProcess:
                     "error": None,
                     "predictions": predictions
                 })
-            except multiprocessing.queues.Empty:  # Correct exception for Queue.get()
+            except multiprocessing.queues.Empty:
                 if self.stop_event.is_set():
-                    break  # Exit loop if stop event set during timeout
+                    break
             except Exception as e:
                 logger.exception(f"Error during prediction in process {self.model_id}:")
                 self.result_queue.put({
@@ -380,12 +402,11 @@ class InferenceProcess:
                     "error": str(e),
                     "predictions": None
                 })
-                break  # Important: Exit on error, don't keep the process running
+                break
 
         logger.info(f"Inference process stopped for model {self.model_id}")
 
     def predict(self, data: List[Dict]):
-        # Put the data on the input queue, do *not* access self.model here
         self.input_queue.put(data)
 
     def start(self):
@@ -397,11 +418,10 @@ class InferenceProcess:
 
     def stop(self):
         if self.process and self.process.is_alive():
-            self.stop_event.set()  # Set the stop event
-            # Signal the process to stop by sending None
+            self.stop_event.set()
             self.input_queue.put(None)
-            self.process.join()  # Wait for process to terminate
-            self.process = None  # Clear process reference
+            self.process.join()
+            self.process = None
 
         else:
             raise Exception("Inference process is not running.")
@@ -414,9 +434,19 @@ inference_processes: Dict[str, InferenceProcess] = {}
 
 
 @app.post("/upload_dataset/")
-async def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_dataset(
+        file: UploadFile = File(...),
+        name: str = Form(...),
+        description: Optional[str] = Form(None),
+        author: Optional[str] = Form(None),
+        target_variable: Optional[str] = Form(None),
+        image: Optional[UploadFile] = Form(None),
+        db: Session = Depends(get_db)
+
+):
     logger.info(f"Received file: {file.filename}")
     logger.info(f"File content type {file.content_type}")
+
     try:
         if file.content_type != "text/csv":
             raise HTTPException(
@@ -424,31 +454,118 @@ async def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get
 
         contents = await file.read()
         df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
-        # Generate unique filename using UUID + original filename
         filename = f"{uuid.uuid4()}_{file.filename}"
-        # filepath = os.path.join(UPLOAD_FOLDER, filename) # No need UPLOAD_FOLDER
+        filepath = os.path.join(UPLOADS_DIR, filename)
 
-        # Check for duplicate filenames
         existing_dataset = db.query(Dataset).filter(Dataset.filename == filename).first()
         if existing_dataset:
             raise HTTPException(status_code=409, detail="File with this name already exists.")
-
-
-        with open(filename, "wb") as f: # save file without UPLOAD_FOLDER
+        with open(filepath, "wb") as f:
             f.write(contents)
 
-        # Store dataset info in the database
-        new_dataset = Dataset(filename=filename, columns=df.columns.tolist())
+        image_filename = None
+        if image:
+            if not image.content_type.startswith("image/"):
+                raise HTTPException(status_code=400, detail="Invalid image file type.")
+
+            image_filename = f"{uuid.uuid4()}_{image.filename}"
+            image_path = os.path.join(UPLOADS_DIR, image_filename)
+            with open(image_path, "wb") as img_file:
+                img_file.write(await image.read())
+
+        new_dataset = Dataset(filename=filename, columns=df.columns.tolist(),
+                              name=name, description=description, author=author,
+                              target_variable=target_variable, image_filename=image_filename)
+
         db.add(new_dataset)
         db.commit()
         db.refresh(new_dataset)
 
-        return {"filename": filename, "columns": df.columns.tolist(), "id": new_dataset.id}
+        return {"filename": filename, "columns": df.columns.tolist(), "id": new_dataset.id,
+                'imageUrl': f"/dataset/{new_dataset.id}/image" if new_dataset.image_filename else None}
+
+
     except HTTPException as e:
-      raise e
+        raise e
     except Exception as e:
         logger.exception("Error uploading dataset")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dataset/{dataset_id}", response_model=DatasetModel)
+async def get_dataset(dataset_id: str, db: Session = Depends(get_db)):
+    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    # Добавляем явное формирование imageUrl
+    image_url = f"/dataset/{dataset.id}/image" if dataset.image_filename else None
+    return DatasetModel(
+        id=dataset.id,
+        filename=dataset.filename,
+        upload_date=dataset.upload_date,
+        columns=dataset.columns,
+        name=dataset.name,
+        description=dataset.description,
+        author=dataset.author,
+        target_variable=dataset.target_variable,
+        imageUrl=image_url  # Добавляем imageUrl в ответ
+    )
+
+
+@app.get("/dataset/{dataset_id}/image")
+async def get_dataset_image(dataset_id: str, db: Session = Depends(get_db)):
+    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not dataset or not dataset.image_filename:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    image_path = os.path.join(UPLOADS_DIR, dataset.image_filename)
+    if not os.path.exists(image_path):
+        raise HTTPException(status_code=404, detail="Image file not found on server")
+    try:
+        with open(image_path, "rb") as image_file:
+            return Response(content=image_file.read(), media_type="image/jpeg")  # Or appropriate media type
+    except Exception as e:
+        logger.exception(f"Error reading image file: {e}")
+        raise HTTPException(status_code=500, detail=f"Error reading image file: {e}")
+
+
+@app.get("/datasets/", response_model=List[DatasetModel])
+async def list_datasets(db: Session = Depends(get_db)):
+    datasets = db.query(Dataset).all()
+    logger.info(f"Datasets from DB: {datasets}")
+    response_data = []
+    for dataset in datasets:
+        # Correctly determine imageUrl:
+        if dataset.image_filename:
+            image_url = f"/dataset/{dataset.id}/image"
+        else:
+            image_url = None  # Explicitly set to None if no image
+
+        dataset_model = DatasetModel.from_orm(dataset)
+        dataset_model.imageUrl = image_url  # Assign the correct URL
+        response_data.append(dataset_model)
+
+    logger.info(f"Response data (list_datasets): {response_data}")
+    return response_data
+
+
+
+
+@app.get("/placeholder.png")
+async def get_placeholder_image():
+    placeholder_path = os.path.join(BASE_DIR, "placeholder.png")
+    if not os.path.exists(placeholder_path):
+        # Create a very basic placeholder image on-the-fly if needed
+        from PIL import Image, ImageDraw
+
+        img = Image.new('RGB', (300, 200), color=(200, 200, 200))
+        d = ImageDraw.Draw(img)
+        d.text((100, 100), "Placeholder", fill=(50, 50, 50))
+        img.save(placeholder_path)
+
+    with open(placeholder_path, "rb") as image_file:
+        return Response(content=image_file.read(), media_type="image/png")
 
 
 @app.post("/train/")
@@ -504,21 +621,21 @@ async def get_train_status(task_id: str):
 @app.get("/trained_models/", response_model=List[TrainedModel])
 async def get_trained_models(db: Session = Depends(get_db)):
     db_models = db.query(DBModel).all()
-    # Convert to Pydantic models, *excluding* model_data.
-    return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_data'}) for db_model in db_models]
+    return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_filename'}) for db_model in
+            db_models]
+
 
 @app.get("/trained_models/search_sort", response_model=List[TrainedModel])
 async def search_sort_trained_models(
-    db: Session = Depends(get_db),
-    search_query: Optional[str] = None,
-    sort_by: Optional[str] = "start_time",  # Default sort by start_time
-    sort_order: Optional[str] = "desc",  # Default sort order (asc/desc)
-    model_type: Optional[str] = None,      # Filter by model type
-    dataset_filename: Optional[str] = None # Filter by dataset filename
+        db: Session = Depends(get_db),
+        search_query: Optional[str] = None,
+        sort_by: Optional[str] = "start_time",
+        sort_order: Optional[str] = "desc",
+        model_type: Optional[str] = None,
+        dataset_filename: Optional[str] = None
 ):
     query = db.query(DBModel)
 
-    # Filtering
     if search_query:
         query = query.filter(
             (DBModel.id.ilike(f"%{search_query}%")) |
@@ -530,26 +647,26 @@ async def search_sort_trained_models(
     if dataset_filename:
         query = query.filter(DBModel.dataset_filename.ilike(f"%{dataset_filename}%"))
 
-    # Sorting
     if sort_by:
         if sort_by == "start_time":
             sort_column = DBModel.start_time
-        elif sort_by =="r2_score" and sort_order:
-             if sort_order == "asc":
-                 query = query.order_by(sqlalchemy.asc(DBModel.metrics['r2_score'].cast(Float)))
-             elif sort_order == "desc":
-                 query = query.order_by(sqlalchemy.desc(DBModel.metrics['r2_score'].cast(Float)))
-             return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_data'}) for db_model in query.all()]
+        elif sort_by == "r2_score" and sort_order:
+            if sort_order == "asc":
+                query = query.order_by(sqlalchemy.asc(DBModel.metrics['r2_score'].cast(Float)))
+            elif sort_order == "desc":
+                query = query.order_by(sqlalchemy.desc(DBModel.metrics['r2_score'].cast(Float)))
+            return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_filename'}) for db_model
+                    in query.all()]
         elif sort_by == "mse" and sort_order:
             if sort_order == "asc":
                 query = query.order_by(sqlalchemy.asc(DBModel.metrics['mse'].cast(Float)))
             elif sort_order == "desc":
                 query = query.order_by(sqlalchemy.desc(DBModel.metrics['mse'].cast(Float)))
-            return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_data'}) for db_model in query.all()]
+            return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_filename'}) for db_model
+                    in query.all()]
 
-        else:  # Add more sorting options as needed
+        else:
             sort_column = getattr(DBModel, sort_by, None)
-
 
         if sort_column is not None:
             if sort_order == "asc":
@@ -558,7 +675,8 @@ async def search_sort_trained_models(
                 query = query.order_by(sort_column.desc())
 
     db_models = query.all()
-    return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_data'}) for db_model in db_models]
+    return [TrainedModel(**{k: v for k, v in db_model.__dict__.items() if k != 'model_filename'}) for db_model in
+            db_models]
 
 
 @app.get("/features/{model_id}", response_model=List[str])
@@ -567,10 +685,9 @@ async def get_model_features(model_id: str, db: Session = Depends(get_db)):
     if not db_model:
         raise HTTPException(status_code=404, detail="Model not found")
 
-    # dataset_path = os.path.join(UPLOAD_FOLDER, db_model.dataset_filename) # No UPLOAD_FOLDER
+    dataset_path = os.path.join(UPLOADS_DIR, db_model.dataset_filename)
     try:
-        # df = pd.read_csv(dataset_path) # read directly
-        df = pd.read_csv(io.StringIO(open(db_model.dataset_filename, 'r', encoding='utf-8').read()))
+        df = pd.read_csv(dataset_path)
         feature_names = df.drop(
             columns=[db_model.target_column]).columns.tolist()
         return feature_names
@@ -579,65 +696,63 @@ async def get_model_features(model_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/download_dataset/{filename}")
-async def download_dataset(filename: str):
-    # filepath = os.path.join(UPLOAD_FOLDER, filename) # No UPLOAD_FOLDER
-    if not os.path.exists(filename): # Check directly
+async def download_dataset(filename: str, db: Session = Depends(get_db)):
+    filepath = os.path.join(UPLOADS_DIR, filename)
+    if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="File not found")
 
-    with open(filename, "rb") as f: # Open directly
+    dataset = db.query(Dataset).filter(Dataset.filename == filename).first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="File not found in database")
+
+    with open(filepath, "rb") as f:
         content = f.read()
 
     return Response(content=content, media_type="text/csv", headers={
         "Content-Disposition": f"attachment; filename={filename}"
     })
 
-@app.get("/datasets/", response_model=List[DatasetModel])
-async def list_datasets(db: Session = Depends(get_db)):
-    """Lists all uploaded datasets."""
-    datasets = db.query(Dataset).all()
-    return datasets
-
-@app.get("/dataset/{dataset_id}", response_model=DatasetModel)
-async def get_dataset(dataset_id: str, db: Session = Depends(get_db)):
-    """Retrieves details of a specific dataset by ID."""
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not dataset:
-        raise HTTPException(status_code=404, detail="Dataset not found")
-    return dataset
-
 
 @app.delete("/dataset/{dataset_id}")
 async def delete_dataset(dataset_id: str, db: Session = Depends(get_db)):
-    """Deletes a dataset from the database and the filesystem."""
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    # Delete associated trained models first (cascading delete)
-    db.query(DBModel).filter(DBModel.dataset_filename == dataset.filename).delete()
+    associated_models = db.query(DBModel).filter(DBModel.dataset_filename == dataset.filename).all()
+    for model in associated_models:
+        model_path = os.path.join(MODELS_DIR, model.model_filename)
+        try:
+            os.remove(model_path)
+        except FileNotFoundError:
+            pass
+        db.delete(model)
 
-
-    # Delete the dataset file
-    # filepath = os.path.join(UPLOAD_FOLDER, dataset.filename) # No UPLOAD_FOLDER
+    filepath = os.path.join(UPLOADS_DIR, dataset.filename)
     try:
-        os.remove(dataset.filename) # Delete directly
+        os.remove(filepath)
     except FileNotFoundError:
-        pass  # File might have been deleted already
+        pass
     except Exception as e:
         logger.exception(f"Error deleting file {dataset.filename}")
-        db.rollback()  # rollback incase some models where deleted.
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"Error deleting file: {e}")
 
-    # Delete the dataset record from the database
+    # Delete image
+    if dataset.image_filename:
+        image_path = os.path.join(UPLOADS_DIR, dataset.image_filename)
+        try:
+            os.remove(image_path)
+        except FileNotFoundError:
+            pass
+
     db.delete(dataset)
     db.commit()
     return {"message": f"Dataset '{dataset.filename}' deleted"}
 
 
-
 @app.post("/start_inference/{model_id}")
 async def start_inference_endpoint(model_id: str, db: Session = Depends(get_db)):
-    """Starts an inference process."""
     global inference_processes
 
     if model_id in inference_processes and inference_processes[model_id].process.is_alive():
@@ -646,24 +761,24 @@ async def start_inference_endpoint(model_id: str, db: Session = Depends(get_db))
             "status": "running",
             "model_id": model_id,
             "upload_url": f"http://localhost:8000/predict/{model_id}",
-            "json_url": "See docs on http://localhost:8000/docs#/default/predict_endpoint_predict__model_id__post"
+            "json_url": "http://localhost:8000/docs#/default/predict_endpoint_predict__model_id__post"
         }
 
     db_model = db.query(DBModel).filter(DBModel.id == model_id).first()
-    if not db_model or not db_model.model_data:
+    if not db_model or not db_model.model_filename:
         raise HTTPException(
             status_code=404,
             detail="Model not found or model data is missing"
         )
 
     try:
-        if len(db_model.model_data) == 0:
-            raise ValueError("Empty model data")
+        model_path = os.path.join(MODELS_DIR, db_model.model_filename)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found at {model_path}")
 
-        # Always create a *new* queue for each process
         result_queue = Queue()
         inference_process = InferenceProcess(
-            model_id, db_model.model_data, result_queue
+            model_id, db_model.model_filename, result_queue
         )
         inference_process.start()
         inference_processes[model_id] = inference_process
@@ -680,7 +795,7 @@ async def start_inference_endpoint(model_id: str, db: Session = Depends(get_db))
         "status": "running",
         "model_id": model_id,
         "upload_url": f"http://localhost:8000/predict/{model_id}",
-        "json_url": "See docs on http://localhost:8000/docs#/default/predict_endpoint_predict__model_id__post"
+        "json_url": "http://localhost:8000/docs#/default/predict_endpoint_predict__model_id__post"
     }
 
 
@@ -692,9 +807,8 @@ async def predict_endpoint(model_id: str, data: List[Dict[str, Union[float, int,
 
     result_queue = inference_processes[model_id].result_queue
     try:
-        inference_processes[model_id].predict(data)  # Put data on input queue
-        # Get result from the result queue, with a timeout
-        result = result_queue.get(timeout=10)  # Wait up to 10 seconds
+        inference_processes[model_id].predict(data)
+        result = result_queue.get(timeout=10)
 
         if result["error"]:
             raise HTTPException(status_code=500, detail=result["error"])
@@ -708,7 +822,6 @@ async def predict_endpoint(model_id: str, data: List[Dict[str, Union[float, int,
 
 @app.delete("/stop_inference/{model_id}")
 async def stop_inference_endpoint(model_id: str):
-    """Stops the inference process."""
     global inference_processes
 
     if model_id not in inference_processes:
@@ -726,7 +839,6 @@ async def stop_inference_endpoint(model_id: str):
 
 @app.get("/inference_status/{model_id}")
 async def inference_status_endpoint(model_id: str):
-    """Checks if the inference process is running."""
     global inference_processes
     if model_id not in inference_processes or not inference_processes[model_id].process.is_alive():
         return {"status": "not running"}
