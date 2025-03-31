@@ -8,8 +8,11 @@ import './assets/styles/refer.css'
 import 'primevue/resources/primevue.min.css'            // Базовые стили
 import 'primeicons/primeicons.css'                      // Иконки
 import ToastService from 'primevue/toastservice'
+import Tooltip from 'primevue/tooltip';
+
 const app = createApp(App)
 app.use(router)
 app.use(PrimeVue)
 app.use(ToastService)
+app.directive('tooltip', Tooltip);
 app.mount('#app')

@@ -8,7 +8,7 @@ import pandas as pd
 from typing import List, Dict, Optional, Union, Any
 from pydantic import BaseModel, validator, Field, ValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Response
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Response, Query
 import joblib
 # ML
 from sklearn.linear_model import LinearRegression
@@ -149,17 +149,24 @@ class DatasetModel(BaseModel):
     id: str
     filename: str
     upload_date: datetime
-    columns: List[str]
+    columns: List[str] # Original list of column names
     name: Optional[str] = None
     description: Optional[str] = None
     author: Optional[str] = None
     target_variable: Optional[str] = None
     imageUrl: Optional[str] = None
+    # --- New fields for detail view ---
+    file_size: Optional[int] = None # Size in bytes
+    row_count: Optional[int] = None # Number of data rows (excluding header)
+    column_types: Optional[Dict[str, str]] = None # Dictionary mapping column name to pandas dtype string
 
     class Config:
         orm_mode = True
         from_attributes = True  # Add this line!
 
+class DatasetPreviewResponse(BaseModel):
+    preview: List[Dict[str, Any]] # List of dictionaries representing rows
+    column_types: Optional[Dict[str, str]] = None # Column types detected from preview
 
 class RunningModel(BaseModel):
     model_id: str
@@ -169,6 +176,7 @@ class RunningModel(BaseModel):
     metrics: Dict[str, float]
     status: str
     api_url: str
+
 
 
 # --- FastAPI App ---
@@ -402,7 +410,7 @@ class InferenceProcess:
                     "error": str(e),
                     "predictions": None
                 })
-                break
+                #break
 
         logger.info(f"Inference process stopped for model {self.model_id}")
 
@@ -494,23 +502,65 @@ async def upload_dataset(
 
 @app.get("/dataset/{dataset_id}", response_model=DatasetModel)
 async def get_dataset(dataset_id: str, db: Session = Depends(get_db)):
+    """Gets detailed information about a specific dataset by its ID."""
+    logger.debug(f"Fetching details for dataset ID: {dataset_id}")
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not dataset:
+        logger.warning(f"Dataset with ID {dataset_id} not found in DB.")
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    # Добавляем явное формирование imageUrl
+    # Base info from DB
     image_url = f"/dataset/{dataset.id}/image" if dataset.image_filename else None
-    return DatasetModel(
+    file_size = None
+    row_count = None
+    column_types = None
+    filepath = os.path.join(UPLOADS_DIR, dataset.filename)
+
+    # Get file statistics if file exists
+    if os.path.exists(filepath):
+        try:
+            file_size = os.path.getsize(filepath)
+            logger.debug(f"File size for {dataset.filename}: {file_size} bytes")
+
+            # Count rows efficiently (assuming header row exists)
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                row_count = sum(1 for _ in f) - 1 # Subtract 1 for header
+            logger.debug(f"Row count for {dataset.filename}: {row_count}")
+
+            # Get column types using pandas on a sample
+            df_sample = pd.read_csv(filepath, nrows=50) # Read a small sample
+            column_types = {col: str(dtype) for col, dtype in df_sample.dtypes.items()}
+            logger.debug(f"Column types detected for {dataset.filename}: {column_types}")
+
+        except FileNotFoundError:
+             logger.error(f"File not found on disk for dataset {dataset_id} at path {filepath}, though DB record exists.")
+             # Don't raise 404 here, return DB info but mark stats as unavailable
+             file_size = -1 # Indicate file missing
+             row_count = -1
+        except Exception as e:
+            logger.error(f"Error getting file stats for {dataset.filename} (ID: {dataset_id}): {e}", exc_info=True)
+            # Return DB info but indicate stats couldn't be retrieved
+            file_size = -2 # Indicate error getting stats
+            row_count = -2
+
+    # Construct the response model using all gathered info
+    response_data = DatasetModel(
         id=dataset.id,
         filename=dataset.filename,
         upload_date=dataset.upload_date,
-        columns=dataset.columns,
+        columns=dataset.columns, # List of column names from DB
         name=dataset.name,
         description=dataset.description,
         author=dataset.author,
         target_variable=dataset.target_variable,
-        imageUrl=image_url  # Добавляем imageUrl в ответ
+        imageUrl=image_url,
+        # Add the new stats fields
+        file_size=file_size,
+        row_count=row_count,
+        column_types=column_types
     )
+    logger.debug(f"Returning details for dataset ID: {dataset_id}")
+    return response_data
 
 
 @app.get("/dataset/{dataset_id}/image")
@@ -530,25 +580,93 @@ async def get_dataset_image(dataset_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Error reading image file: {e}")
 
 
+# *** MODIFIED Endpoint to return list of datasets (using updated DatasetModel) ***
 @app.get("/datasets/", response_model=List[DatasetModel])
 async def list_datasets(db: Session = Depends(get_db)):
-    datasets = db.query(Dataset).all()
-    logger.info(f"Datasets from DB: {datasets}")
+    """Lists all available datasets with basic information."""
+    logger.debug("Fetching list of all datasets.")
+    datasets_db = db.query(Dataset).order_by(Dataset.upload_date.desc()).all() # Order by upload date
     response_data = []
-    for dataset in datasets:
-        # Correctly determine imageUrl:
-        if dataset.image_filename:
-            image_url = f"/dataset/{dataset.id}/image"
-        else:
-            image_url = None  # Explicitly set to None if no image
-
-        dataset_model = DatasetModel.from_orm(dataset)
-        dataset_model.imageUrl = image_url  # Assign the correct URL
+    for dataset in datasets_db:
+        image_url = f"/dataset/{dataset.id}/image" if dataset.image_filename else None
+        # *** Decision: DO NOT fetch file stats (size, rows, types) here ***
+        # It would require reading every file and slow down the list view significantly.
+        # Stats will be fetched on demand by the detail view endpoint (/dataset/{id}).
+        dataset_model = DatasetModel(
+             id=dataset.id,
+             filename=dataset.filename,
+             upload_date=dataset.upload_date,
+             columns=dataset.columns,
+             name=dataset.name,
+             description=dataset.description,
+             author=dataset.author,
+             target_variable=dataset.target_variable,
+             imageUrl=image_url,
+             # File stats are intentionally left as None here
+             file_size=None,
+             row_count=None,
+             column_types=None
+         )
         response_data.append(dataset_model)
 
-    logger.info(f"Response data (list_datasets): {response_data}")
+    logger.debug(f"Returning {len(response_data)} datasets.")
     return response_data
 
+# *** NEW Endpoint for fetching dataset preview ***
+@app.get("/dataset_preview/{filename}", response_model=DatasetPreviewResponse)
+async def get_dataset_preview(
+    filename: str, # Can be filename or dataset ID
+    rows: int = Query(20, ge=1, le=100), # Get first N rows, limit query param
+    db: Session = Depends(get_db) # Inject DB session to potentially look up by ID
+    ):
+    """
+    Gets a preview (first N rows) of a dataset's content.
+    Accepts either the dataset filename or the dataset ID.
+    """
+    logger.debug(f"Request for preview of '{filename}', rows={rows}")
+    filepath = os.path.join(UPLOADS_DIR, filename)
+    actual_filename = filename
+
+    # Check if the file exists directly
+    if not os.path.exists(filepath):
+        logger.warning(f"Preview request: File '{filename}' not found directly. Checking if it's a dataset ID.")
+        # If not found, check if 'filename' might be a dataset ID
+        dataset_by_id = db.query(Dataset).filter(Dataset.id == filename).first()
+        if dataset_by_id and dataset_by_id.filename:
+            logger.debug(f"Found dataset by ID {filename}. Actual filename: {dataset_by_id.filename}")
+            actual_filename = dataset_by_id.filename
+            filepath = os.path.join(UPLOADS_DIR, actual_filename)
+            if not os.path.exists(filepath):
+                 logger.error(f"File path {filepath} for dataset ID {filename} not found on disk, inconsistent state.")
+                 raise HTTPException(status_code=404, detail=f"Dataset file associated with ID {filename} not found on server.")
+        else:
+            logger.error(f"Preview request: Neither file nor dataset ID '{filename}' found.")
+            raise HTTPException(status_code=404, detail="Dataset file or ID not found.")
+
+    # Now we have a valid filepath
+    try:
+        logger.debug(f"Reading preview from: {filepath}")
+        df_preview = pd.read_csv(filepath, nrows=rows)
+
+        # Convert NaN/NaT to None for JSON compatibility
+        df_cleaned = df_preview.where(pd.notnull(df_preview), None)
+        preview_data = df_cleaned.to_dict(orient='records')
+
+        # Get column types from the preview
+        column_types = {col: str(dtype) for col, dtype in df_preview.dtypes.items()}
+        logger.debug(f"Preview generated successfully for {actual_filename}.")
+        return DatasetPreviewResponse(preview=preview_data, column_types=column_types)
+
+    except FileNotFoundError:
+         # This should be caught by the initial checks, but handle defensively
+         logger.error(f"FileNotFoundError during preview generation for {actual_filename} at {filepath}.")
+         raise HTTPException(status_code=404, detail="Dataset file not found during preview generation.")
+    except pd.errors.EmptyDataError:
+         logger.warning(f"EmptyDataError during preview for {actual_filename}. Returning empty preview.")
+         return DatasetPreviewResponse(preview=[], column_types={}) # Return empty list if file is empty/header only
+    except Exception as e:
+        logger.error(f"Error reading dataset preview for {actual_filename}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error reading dataset preview: {e}")
 
 
 
@@ -625,6 +743,7 @@ async def get_trained_models(db: Session = Depends(get_db)):
             db_models]
 
 
+
 @app.get("/trained_models/search_sort", response_model=List[TrainedModel])
 async def search_sort_trained_models(
         db: Session = Depends(get_db),
@@ -632,9 +751,20 @@ async def search_sort_trained_models(
         sort_by: Optional[str] = "start_time",
         sort_order: Optional[str] = "desc",
         model_type: Optional[str] = None,
-        dataset_filename: Optional[str] = None
+        dataset_filename: Optional[str] = None,
+        model_id: Optional[str] = None  # Добавляем новый параметр
+
 ):
     query = db.query(DBModel)
+
+    if model_id:
+        query = query.filter(DBModel.id == model_id)
+    elif search_query:
+        query = query.filter(
+            (DBModel.id.ilike(f"%{search_query}%")) |
+            (DBModel.dataset_filename.ilike(f"%{search_query}%")) |
+            (DBModel.target_column.ilike(f"%{search_query}%"))
+        )
 
     if search_query:
         query = query.filter(
@@ -760,7 +890,7 @@ async def start_inference_endpoint(model_id: str, db: Session = Depends(get_db))
             "message": "Inference process already running",
             "status": "running",
             "model_id": model_id,
-            "upload_url": f"http://localhost:8000/predict/{model_id}",
+            "upload_url": f"http://localhost/inference/{model_id}",
             "json_url": "http://localhost:8000/docs#/default/predict_endpoint_predict__model_id__post"
         }
 
@@ -794,7 +924,7 @@ async def start_inference_endpoint(model_id: str, db: Session = Depends(get_db))
         "message": "Inference process started",
         "status": "running",
         "model_id": model_id,
-        "upload_url": f"http://localhost:8000/predict/{model_id}",
+        "upload_url": f"http://localhost/inference/{model_id}",
         "json_url": "http://localhost:8000/docs#/default/predict_endpoint_predict__model_id__post"
     }
 
@@ -864,7 +994,7 @@ async def get_running_models():
                             model_type=db_model.model_type,
                             metrics=db_model.metrics,
                             status="running",
-                            api_url=f"http://localhost:8000/predict/{model_id}",
+                            api_url=f"http://localhost/inference/{model_id}",
                         )
                     )
     return running_models_list
