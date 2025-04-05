@@ -8,6 +8,12 @@
       </div>
       <div class="header-right">
         <Button 
+          label="Train" 
+          icon="pi pi-download" 
+          @click="goToTrain(dataset.id)" 
+          class="p-button-outlined p-button-secondary" 
+        />
+        <Button 
           label="Download" 
           icon="pi pi-download" 
           @click="downloadDataset(dataset.filename)" 
@@ -282,6 +288,9 @@ const shareMenuItems = ref([
   }
 ]);
 
+const goToTrain = (datasetId)=>{
+  router.push({path:'/', query:{dataset: datasetId}});
+};
 // --- Methods ---
 
 const fetchDatasetDetails = async (id) => {
