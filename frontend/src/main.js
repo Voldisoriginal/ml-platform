@@ -10,6 +10,11 @@ import 'primeicons/primeicons.css'                      // Иконки
 import ToastService from 'primevue/toastservice'
 import Tooltip from 'primevue/tooltip';
 
+import { Chart, registerables } from 'chart.js';
+import { BoxPlotController, BoxAndWiskers } from '@sgratzl/chartjs-chart-boxplot';
+import { MatrixController, MatrixElement } from 'chartjs-chart-matrix';
+
+Chart.register(...registerables, BoxPlotController, BoxAndWiskers, MatrixController, MatrixElement);
 const app = createApp(App)
 app.use(router)
 app.use(PrimeVue)
