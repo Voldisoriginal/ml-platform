@@ -48,19 +48,20 @@
           <div v-for="param in selectedModelDefinition.parameters" :key="param.name" class="p-field p-col-12 p-md-6">
              <label :for="param.name">{{ param.label }}</label>
              <!-- Используем v-if для выбора компонента PrimeVue -->
-             <InputNumber
-               v-if="param.component === 'InputNumber'"
-               :inputId="param.name"
-               v-model="currentParams[param.name]"
-               :mode="param.type === 'float' ? 'decimal' : 'integer'"
-               :minFractionDigits="param.type === 'float' ? 1 : 0"
-               :maxFractionDigits="param.type === 'float' ? 5 : 0"
-               :min="param.validation?.min"
-               :max="param.validation?.max"
-               :step="param.type === 'float' ? 0.1 : 1"
-               showButtons
-               @update:modelValue="emitSelection"
-             />
+              <InputNumber
+              v-if="param.component === 'InputNumber'"
+              :inputId="param.name"
+              v-model="currentParams[param.name]"
+              mode="decimal"
+              :minFractionDigits="param.type === 'integer' ? 0 : (param.validation?.minFractionDigits ?? 0)" 
+              :maxFractionDigits="param.type === 'integer' ? 0 : (param.validation?.maxFractionDigits ?? 5)"
+              :min="param.validation?.min"
+              :max="param.validation?.max"
+              :step="param.type === 'float' ? (param.validation?.step ?? 0.1) : (param.validation?.step ?? 1)"
+              showButtons
+              :allowEmpty="true"
+              @update:modelValue="emitSelection"
+              />
              <Dropdown
                 v-else-if="param.component === 'Dropdown'"
                 :inputId="param.name"

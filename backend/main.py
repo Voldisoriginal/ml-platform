@@ -219,7 +219,7 @@ class ModelParams(BaseModel):
 class TrainedModel(BaseModel): # Добавим task_type
     id: str
     model_type: str
-    task_type: str # Добавлено
+    task_type: Optional[str] = None # Allow task_type to be None
     params: Dict[str, Any]
     metrics: Dict[str, float]
     train_settings: TrainSettings # Используем Pydantic модель для вложенности
@@ -580,8 +580,74 @@ def generate_visualizations_task(self, dataset_id: str):
 
 # InferenceProcess class (без изменений)
 class InferenceProcess:
-    # ... (код класса без изменений) ...
-    pass # Убрал код для краткости
+    def __init__(self, model_id: str, model_filename: str, result_queue: Queue):
+        self.model_id = model_id
+        self.model_filename = model_filename
+        self.model_path = os.path.join(MODELS_DIR, self.model_filename)
+        self.model: Optional[Any] = None
+        self.process: Optional[Process] = None
+        self.result_queue = result_queue
+        self.input_queue = Queue()
+        self.stop_event = Event()
+
+    def _run(self):
+        logger.info(f"Inference process started for model {self.model_id}")
+        try:
+            self.model = joblib.load(self.model_path)
+        except Exception as e:
+            logger.exception(f"Error loading model in process {self.model_id}:")
+            self.result_queue.put({
+                "model_id": self.model_id,
+                "error": str(e),
+                "predictions": None
+            })
+            return
+
+        while not self.stop_event.is_set():
+            try:
+                data = self.input_queue.get(timeout=1)
+                if data is None:
+                    continue
+                input_df = pd.DataFrame(data)
+                predictions = self.model.predict(input_df).tolist()
+                self.result_queue.put({
+                    "model_id": self.model_id,
+                    "error": None,
+                    "predictions": predictions
+                })
+            except multiprocessing.queues.Empty:
+                if self.stop_event.is_set():
+                    break
+            except Exception as e:
+                logger.exception(f"Error during prediction in process {self.model_id}:")
+                self.result_queue.put({
+                    "model_id": self.model_id,
+                    "error": str(e),
+                    "predictions": None
+                })
+                # break
+
+        logger.info(f"Inference process stopped for model {self.model_id}")
+
+    def predict(self, data: List[Dict]):
+        self.input_queue.put(data)
+
+    def start(self):
+        if self.process is None or not self.process.is_alive():
+            self.process = Process(target=self._run, daemon=True)
+            self.process.start()
+        else:
+            raise Exception("Inference process already running")
+
+    def stop(self):
+        if self.process and self.process.is_alive():
+            self.stop_event.set()
+            self.input_queue.put(None)
+            self.process.join()
+            self.process = None
+
+        else:
+            raise Exception("Inference process is not running.")
 
 inference_processes: Dict[str, InferenceProcess] = {}
 
@@ -1199,68 +1265,20 @@ async def search_sort_trained_models(
          raise HTTPException(status_code=500, detail="Error retrieving trained models.")
 
 
-@app.get("/features/{model_id}", response_model=List[str]) # без изменений
+@app.get("/features/{model_id}", response_model=List[str])
 async def get_model_features(model_id: str, db: Session = Depends(get_db)):
-    # ... (код без изменений) ...
     db_model = db.query(DBModel).filter(DBModel.id == model_id).first()
     if not db_model:
         raise HTTPException(status_code=404, detail="Model not found")
 
-    # --- Важно: Фичи могут зависеть от препроцессинга! ---
-    # Загрузка модели могла бы дать самый точный список фичей (model.feature_names_in_)
-    # Но это дольше. Пока оставим загрузку датасета.
     dataset_path = os.path.join(UPLOADS_DIR, db_model.dataset_filename)
     try:
-        # Читаем только заголовки, чтобы получить колонки
-        df_cols = pd.read_csv(dataset_path, nrows=0).columns.tolist()
-
-        # --- Повторяем логику препроцессинга из задачи обучения ---
-        # Это важно, чтобы фичи соответствовали тем, на которых обучалась модель
-        temp_df_for_cols = pd.DataFrame(columns=df_cols) # Создаем пустой DataFrame со всеми колонками
-
-        target_column = db_model.target_column
-        if target_column not in temp_df_for_cols.columns:
-             logger.error(f"Target column '{target_column}' from model record not found in dataset file '{db_model.dataset_filename}' header.")
-             # Возможно, стоит вернуть исходные колонки файла, но с предупреждением
-             # return df_cols
-             raise HTTPException(status_code=500, detail=f"Inconsistency: Target column '{target_column}' not in dataset header.")
-
-
-        # Применяем OneHotEncoding к категориальным фичам (как в обучении)
-        categorical_features = temp_df_for_cols.select_dtypes(include=['object', 'category']).columns.tolist()
-        if target_column in categorical_features:
-             categorical_features.remove(target_column)
-
-        if categorical_features:
-             logger.debug(f"Applying virtual OneHotEncoding to get feature names for: {categorical_features}")
-             # Создаем фиктивные данные, чтобы get_dummies сработал
-             dummy_data = {col: ['dummy'] for col in temp_df_for_cols.columns}
-             temp_df_filled = pd.DataFrame(dummy_data)
-
-             try:
-                 # Применяем get_dummies
-                 df_processed_cols = pd.get_dummies(temp_df_filled, columns=categorical_features, drop_first=True)
-                 feature_names = df_processed_cols.drop(columns=[target_column], errors='ignore').columns.tolist()
-                 logger.debug(f"Derived feature names after encoding: {feature_names}")
-             except Exception as e:
-                 logger.error(f"Error applying virtual get_dummies for feature name derivation: {e}", exc_info=True)
-                 # Откат к простому списку колонок из файла, если get_dummies не сработал
-                 feature_names = [col for col in df_cols if col != target_column]
-                 logger.warning("Falling back to raw dataset columns (excluding target) due to processing error.")
-
-        else:
-             # Если не было категориальных фич, просто удаляем целевую колонку
-             feature_names = [col for col in df_cols if col != target_column]
-             logger.debug(f"Derived feature names (no encoding needed): {feature_names}")
-
+        df = pd.read_csv(dataset_path)
+        feature_names = df.drop(
+            columns=[db_model.target_column]).columns.tolist()
         return feature_names
-
     except FileNotFoundError:
-        logger.error(f"Dataset file not found for model {model_id}: {dataset_path}")
-        raise HTTPException(status_code=404, detail=f"Dataset file '{db_model.dataset_filename}' associated with the model not found.")
-    except Exception as e:
-        logger.error(f"Error reading dataset columns for features of model {model_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error determining model features.")
+        raise HTTPException(status_code=404, detail="Dataset file not found")
 
 
 @app.get("/download_dataset/{filename}") # без изменений
@@ -1660,7 +1678,7 @@ async def get_running_models(db: Session = Depends(get_db)): # Добавим DB
                         model_type=db_model.model_type,
                         metrics=db_model.metrics if db_model.metrics else {}, # Обработка None
                         status="running",
-                        api_url=f"/predict/{model_id}" # Используем относительный URL
+                        api_url=f"/inference/{model_id}" # Используем относительный URL
                     )
                     running_models_list.append(running_model_data)
                 except ValidationError as e:
