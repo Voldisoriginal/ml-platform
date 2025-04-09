@@ -10,6 +10,7 @@ from typing import List, Dict, Optional, Union, Any, Literal
 from pydantic import BaseModel, validator, Field, ValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Response, Query
+from fastapi.responses import PlainTextResponse
 import joblib
 # ML
 from sklearn.linear_model import LinearRegression, LogisticRegression # Добавим LogisticRegression для примера классификации
@@ -276,6 +277,80 @@ class VisualizationDataResponse(BaseModel):
     class Config:
         orm_mode = True
         from_attributes = True
+
+
+def generate_dataset_info_markdown(dataset_id: str, dataset_name: str, dataset_filename: str) -> str:
+    """Генерирует содержимое Markdown файла для датасета."""
+
+    # Получаем базовый URL API из переменной окружения
+    api_base_url = os.environ.get("VITE_API_BASE_URL", "http://localhost")
+
+    # Формируем команду скачивания
+    download_code_py = f"""
+import requests
+import os
+
+# --- Configuration ---
+DATASET_FILENAME = "{dataset_filename}"
+API_BASE_URL = "{api_base_url}"  # Adjust if your API runs elsewhere
+DOWNLOAD_PATH = "./"  # Where to save the file (current directory)
+# -------------------
+
+download_url = f"{{API_BASE_URL}}/download_dataset/{{DATASET_FILENAME}}"
+save_to = os.path.join(DOWNLOAD_PATH, DATASET_FILENAME)
+
+print(f"Attempting to download: {{download_url}}")
+print(f"Saving to: {{save_to}}")
+
+try:
+    response = requests.get(download_url, stream=True)
+    response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+
+    with open(save_to, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+    print(f"\\nDataset downloaded successfully to '{{save_to}}'")
+
+except requests.exceptions.RequestException as e:
+    print(f"\\nError downloading dataset: {{e}}")
+except Exception as e:
+    print(f"\\nAn unexpected error occurred: {{e}}")
+"""
+
+    # Формируем Markdown строку
+    markdown_content = f"""
+# Dataset: {dataset_name or "Unnamed Dataset"}
+
+Dataset ID: {dataset_id}
+Original Filename: {dataset_filename}
+
+## Download via Python
+
+You can use the following Python script to download this dataset:
+```python
+{download_code_py.strip()}
+```
+This file was automatically generated on {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+    return markdown_content.strip()
+def save_markdown_file(dataset_id: str, content: str):
+    """Сохраняет Markdown контент в файл."""
+    md_filename = f"{dataset_id}_info.md"
+    md_filepath = os.path.join(UPLOADS_DIR, md_filename)
+    try:
+        with open(md_filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        logger.info(f"Saved Markdown info file: {md_filepath}")
+        return md_filepath
+    except Exception as e:
+        logger.error(f"Failed to save Markdown file {md_filepath}: {e}")
+    return None
+
+def get_markdown_filepath(dataset_id: str) -> str:
+    """Возвращает ожидаемый путь к Markdown файлу."""
+    md_filename = f"{dataset_id}_info.md"
+    return os.path.join(UPLOADS_DIR, md_filename)
+
 
 def replace_nan_inf_with_none(obj):
     """Recursively replaces NaN and Infinity in dicts/lists with None."""
@@ -944,6 +1019,19 @@ async def upload_dataset(
         db.commit()
         db.refresh(new_dataset)
 
+        # --- АВТОГЕНЕРАЦИЯ MARKDOWN ---
+        try:
+            logger.info(f"Attempting automatic Markdown generation for new dataset {new_dataset.id}")
+            markdown_content = generate_dataset_info_markdown(
+                dataset_id=new_dataset.id,
+                dataset_name=new_dataset.name,
+                dataset_filename=new_dataset.filename
+            )
+            save_markdown_file(new_dataset.id, markdown_content)
+            # Не нужно прерывать основной ответ, если генерация Markdown не удалась, просто логируем
+        except Exception as md_gen_err:
+            logger.error(f"Automatic Markdown generation failed for dataset {new_dataset.id}: {md_gen_err}", exc_info=False) # exc_info=False чтобы не загромождать лог при обычной ошибке генерации
+
         return {"filename": filename, "columns": df.columns.tolist(), "id": new_dataset.id,
                 'imageUrl': f"/dataset/{new_dataset.id}/image" if new_dataset.image_filename else None}
 
@@ -1088,6 +1176,24 @@ async def get_dataset_image(dataset_id: str, db: Session = Depends(get_db)):
         logger.exception(f"Error reading image file: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading image file: {e}")
 
+@app.get("/dataset/{dataset_id}/info_markdown", response_class=PlainTextResponse)
+async def get_dataset_info_markdown(dataset_id: str):
+    """Возвращает содержимое информационного Markdown файла для датасета."""
+    logger.debug(f"Request for info markdown for dataset ID: {dataset_id}")
+    md_filepath = get_markdown_filepath(dataset_id)
+
+    if not os.path.exists(md_filepath):
+        logger.warning(f"Info markdown file not found: {md_filepath}")
+        raise HTTPException(status_code=404, detail="Info Markdown file not found.")
+
+    try:
+        with open(md_filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+        # Устанавливаем правильный Content-Type
+        return PlainTextResponse(content=content, media_type="text/markdown; charset=utf-8")
+    except Exception as e:
+        logger.error(f"Error reading info markdown file {md_filepath}: {e}")
+        raise HTTPException(status_code=500, detail="Error reading info file.")
 
 @app.get("/datasets/", response_model=List[DatasetModel]) # без изменений
 async def list_datasets(db: Session = Depends(get_db)):
@@ -1116,6 +1222,41 @@ async def list_datasets(db: Session = Depends(get_db)):
     logger.debug(f"Returning {len(response_data)} datasets.")
     return response_data
 
+@app.post("/dataset/{dataset_id}/generate_info_markdown", status_code=201) # 201 Created или 200 OK
+async def generate_dataset_info_markdown_endpoint(dataset_id: str, db: Session = Depends(get_db)):
+    """Генерирует (или перезаписывает) информационный Markdown файл для датасета."""
+    logger.info(f"Request to generate info markdown for dataset ID: {dataset_id}")
+    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not dataset:
+        logger.warning(f"Dataset {dataset_id} not found for markdown generation.")
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+
+    # Проверяем наличие файла данных датасета (опционально, но полезно)
+    dataset_filepath = os.path.join(UPLOADS_DIR, dataset.filename)
+    if not os.path.exists(dataset_filepath):
+         logger.error(f"Cannot generate markdown: Dataset file {dataset.filename} missing for dataset ID {dataset_id}.")
+         raise HTTPException(status_code=404, detail="Associated dataset file not found, cannot generate info.")
+
+
+    try:
+        markdown_content = generate_dataset_info_markdown(
+            dataset_id=dataset.id,
+            dataset_name=dataset.name,
+            dataset_filename=dataset.filename
+        )
+        md_filepath = save_markdown_file(dataset.id, markdown_content)
+
+        if md_filepath:
+             # Можно вернуть 201 если создали, 200 если перезаписали (но сложнее отследить)
+             # Проще всегда возвращать 200 или 201
+             logger.info(f"Successfully generated/updated info markdown for dataset {dataset_id}")
+             return {"message": "Info Markdown file generated successfully."}
+        else:
+             raise HTTPException(status_code=500, detail="Failed to save generated Markdown file.")
+
+    except Exception as e:
+        logger.error(f"Error generating markdown for dataset {dataset_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate info Markdown: {e}")
 
 @app.get("/dataset_preview/{filename}", response_model=DatasetPreviewResponse) # без изменений
 async def get_dataset_preview(
