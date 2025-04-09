@@ -4,6 +4,7 @@ import json
 import uuid
 import os
 import io
+import math
 import pandas as pd
 from typing import List, Dict, Optional, Union, Any, Literal
 from pydantic import BaseModel, validator, Field, ValidationError
@@ -85,6 +86,7 @@ class DatasetVisualization(Base): # без изменений
     visualization_data = Column(JSON)
     status = Column(String, default="PENDING")
     error_message = Column(String, nullable=True)
+    celery_task_id = Column(String, nullable=True, index=True)
     dataset = sqlalchemy.orm.relationship("Dataset")
 
 # Create tables (если добавили поле task_type, может потребоваться миграция Alembic или ручное добавление колонки)
@@ -95,7 +97,8 @@ try:
     # Попытка добавить колонку, если её нет (не самый надежный способ для продакшена)
     with engine.connect() as connection:
         try:
-            connection.execute(sqlalchemy.text("ALTER TABLE trained_models ADD COLUMN task_type VARCHAR;"))
+            #connection.execute(sqlalchemy.text("ALTER TABLE trained_models ADD COLUMN task_type VARCHAR;"))
+            connection.execute(sqlalchemy.text("ALTER TABLE dataset_visualizations ADD COLUMN celery_task_id VARCHAR;"))
             connection.commit() # Не забываем commit для DDL в SQLAlchemy 1.x/2.x без autocommit
         except sqlalchemy.exc.ProgrammingError as e:
             # Игнорируем ошибку, если колонка уже существует
@@ -262,16 +265,28 @@ class RunningModel(BaseModel): # без изменений
     status: str
     api_url: str
 
-class VisualizationDataResponse(BaseModel): # без изменений
+class VisualizationDataResponse(BaseModel):
     id: str
     dataset_id: str
     generated_at: datetime
     visualization_data: Optional[Dict[str, Any]]
     status: str
     error_message: Optional[str] = None
+    celery_task_id: Optional[str] = None
     class Config:
         orm_mode = True
         from_attributes = True
+
+def replace_nan_inf_with_none(obj):
+    """Recursively replaces NaN and Infinity in dicts/lists with None."""
+    if isinstance(obj, dict):
+        return {k: replace_nan_inf_with_none(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [replace_nan_inf_with_none(elem) for elem in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None # Replace NaN/Infinity with JSON null equivalent
+    return obj
 
 # --- Определение доступных моделей (Глобальная переменная) ---
 # Это можно вынести в отдельный конфигурационный файл или базу данных
@@ -575,8 +590,203 @@ def train_model_task(self, dataset_filename: str, target_column: str,
 # generate_visualizations_task (без изменений)
 @celery.task(bind=True, name='generate_visualizations_task')
 def generate_visualizations_task(self, dataset_id: str):
-    # ... (код задачи без изменений) ...
-    pass # Убрал код для краткости, он остается прежним
+    db: Session = SessionLocal()
+    viz_entry: Optional[DatasetVisualization] = None
+    try:
+        # Находим или создаем запись (если ее нет, хотя должна быть создана при запуске)
+        viz_entry = db.query(DatasetVisualization)\
+                      .filter(DatasetVisualization.dataset_id == dataset_id)\
+                      .order_by(DatasetVisualization.generated_at.desc())\
+                      .first()
+        if not viz_entry:
+             # Этого не должно быть, если мы создаем запись в эндпоинте /visualize
+             logger.error(f"Visualization task {self.request.id}: No DB entry found for dataset {dataset_id}!")
+             # Создадим новую запись на всякий случай
+             viz_entry = DatasetVisualization(dataset_id=dataset_id, celery_task_id=self.request.id, status="PENDING")
+             db.add(viz_entry)
+             # Не коммитим сразу, т.к. статус еще PENDING
+             # db.commit() # Лучше обновить статус в конце
+
+        # Обновим task_id, если он изменился (маловероятно, но безопасно)
+        if viz_entry.celery_task_id != self.request.id:
+             viz_entry.celery_task_id = self.request.id
+             # db.commit() # Не коммитим пока
+
+        self.update_state(state='STARTED')
+        logger.info(f"Starting visualization generation for dataset {dataset_id} (Task ID: {self.request.id})")
+
+        # --- ОСНОВНАЯ ЛОГИКА ГЕНЕРАЦИИ ВИЗУАЛИЗАЦИИ ---
+        # (загрузка данных, расчеты гистограмм, боксплотов, корреляций)
+        dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+        if not dataset:
+            raise ValueError(f"Dataset {dataset_id} not found in DB.")
+
+        filepath = os.path.join(UPLOADS_DIR, dataset.filename)
+        if not os.path.exists(filepath):
+             raise FileNotFoundError(f"Dataset file {dataset.filename} not found at {filepath}")
+
+        logger.debug(f"Reading dataset file: {filepath}")
+        # Обработка кодировок
+        df = None
+        try:
+             df = pd.read_csv(filepath, encoding='utf-8')
+        except UnicodeDecodeError:
+             logger.warning(f"UTF-8 decoding failed for {filepath}, trying cp1251.")
+             try:
+                 df = pd.read_csv(filepath, encoding='cp1251')
+             except Exception as read_err:
+                 raise ValueError(f"Could not read CSV file {filepath} with utf-8 or cp1251: {read_err}")
+
+        if df is None or df.empty:
+            raise ValueError(f"Dataset {filepath} is empty or could not be read.")
+
+        logger.info(f"Dataset {dataset.filename} loaded, shape: {df.shape}")
+
+        # Выбираем только числовые колонки для большинства визуализаций
+        numerical_cols = df.select_dtypes(include=np.number).columns.tolist()
+        logger.debug(f"Numerical columns found: {numerical_cols}")
+
+        visualization_results = {}
+
+        # 1. Гистограммы
+        histograms = []
+        for col in numerical_cols:
+            if df[col].nunique() > 1 and df[col].var() > 1e-6 : # Пропускаем константы или почти константы
+                try:
+                    # Пропускаем столбцы с большим количеством NaN, иначе np.histogram может упасть
+                    if df[col].isnull().mean() > 0.9:
+                         logger.warning(f"Skipping histogram for column '{col}' due to high NaN percentage.")
+                         continue
+
+                    # Удаляем NaN перед построением гистограммы
+                    data = df[col].dropna()
+                    if data.empty: continue
+
+                    # Автоматический подбор числа бинов (можно использовать разные стратегии)
+                    counts, bin_edges = np.histogram(data, bins='auto')
+                    histograms.append({
+                        "column": col,
+                        "counts": counts.tolist(),
+                        "bins": bin_edges.tolist()
+                    })
+                    logger.debug(f"Generated histogram for column: {col}")
+                except Exception as e_hist:
+                     logger.warning(f"Could not generate histogram for column '{col}': {e_hist}")
+        visualization_results["histograms"] = histograms
+
+        # 2. Боксплоты (статистики)
+        boxplots = []
+        for col in numerical_cols:
+             if df[col].nunique() > 1:
+                try:
+                    stats_data = df[col].dropna()
+                    if len(stats_data) < 5: # Нужно хотя бы несколько точек для статистики
+                         logger.warning(f"Skipping boxplot stats for column '{col}' due to insufficient data points ({len(stats_data)}).")
+                         continue
+
+                    # Используем describe для получения квантилей, min, max
+                    desc = stats_data.describe()
+                    boxplot_stats = {
+                        "column": col,
+                        "min": desc.get('min'),
+                        "q1": desc.get('25%'),
+                        "median": desc.get('50%'),
+                        "q3": desc.get('75%'),
+                        "max": desc.get('max'),
+                         # Дополнительно можно добавить IQR, выбросы и т.д., если нужно
+                    }
+                    # Проверка на NaN в результатах (может случиться при ошибках)
+                    if any(pd.isna(v) for v in boxplot_stats.values() if isinstance(v, (int, float))):
+                        logger.warning(f"NaN value detected in boxplot stats for column '{col}'. Skipping.")
+                        continue
+
+                    boxplots.append(boxplot_stats)
+                    logger.debug(f"Generated boxplot stats for column: {col}")
+                except Exception as e_box:
+                    logger.warning(f"Could not generate boxplot stats for column '{col}': {e_box}")
+        visualization_results["boxplots"] = boxplots
+
+
+        # 3. Матрица корреляции
+        correlation_matrix = None
+        if len(numerical_cols) >= 2:
+             try:
+                 # Выбираем только числовые столбцы для корреляции
+                 numerical_df = df[numerical_cols]
+                 # Обработка NaN перед корреляцией (например, удаление строк с NaN в этих колонках)
+                 # numerical_df_cleaned = numerical_df.dropna()
+                 # ИЛИ используем метод, который обрабатывает NaN (по умолчанию pandas игнорирует pairwise)
+                 corr = numerical_df.corr(method='pearson') # 'pearson', 'kendall', 'spearman'
+
+                 # Заменяем NaN в матрице (если остались) на None для JSON
+                 corr_cleaned = corr.where(pd.notnull(corr), None)
+
+                 correlation_matrix = {
+                     "columns": corr_cleaned.columns.tolist(),
+                     "data": corr_cleaned.values.tolist()
+                 }
+                 logger.debug(f"Generated correlation matrix for {len(numerical_cols)} columns.")
+             except Exception as e_corr:
+                 logger.error(f"Could not generate correlation matrix: {e_corr}")
+                 correlation_matrix = {"error": str(e_corr)} # Записываем ошибку
+
+        visualization_results["correlation_matrix"] = correlation_matrix
+
+        # --- ЗАВЕРШЕНИЕ ЛОГИКИ ВИЗУАЛИЗАЦИИ ---
+
+        logger.info(f"Visualization generation successful for dataset {dataset_id}.")
+        visualization_results = replace_nan_inf_with_none(visualization_results)
+        # Обновляем запись в БД
+        viz_entry.visualization_data = visualization_results
+        viz_entry.status = "SUCCESS"
+        viz_entry.error_message = None
+        viz_entry.generated_at = datetime.utcnow() # Обновляем время генерации
+        db.commit()
+        logger.debug(f"DB record updated for successful visualization of dataset {dataset_id}")
+
+        # Возвращаем ID записи БД, чтобы эндпоинт статуса мог его передать фронтенду
+        return {"visualization_db_id": viz_entry.id, "message": "Visualization generated successfully."}
+
+    except FileNotFoundError as e:
+         logger.error(f"Visualization Task {self.request.id}: File not found - {e}", exc_info=True)
+         error_msg = str(e)
+         if viz_entry:
+             viz_entry.status = "FAILURE"
+             viz_entry.error_message = f"File not found: {error_msg}"
+             db.commit()
+         self.update_state(state=states.FAILURE, meta={'exc_type': type(e).__name__, 'exc_message': error_msg})
+         raise Ignore() # Не повторять задачу
+
+    except ValueError as e: # Ошибки данных (пустой файл, не та колонка и т.д.)
+         logger.error(f"Visualization Task {self.request.id}: Data error - {e}", exc_info=True)
+         error_msg = str(e)
+         if viz_entry:
+             viz_entry.status = "FAILURE"
+             viz_entry.error_message = f"Data error: {error_msg}"
+             db.commit()
+         self.update_state(state=states.FAILURE, meta={'exc_type': type(e).__name__, 'exc_message': error_msg})
+         raise Ignore()
+
+    except Exception as e:
+        logger.exception(f"Unexpected error in visualization task {self.request.id} for dataset {dataset_id}:")
+        error_msg = f"An unexpected error occurred: {str(e)}"
+        if viz_entry:
+             viz_entry.status = "FAILURE"
+             viz_entry.error_message = error_msg
+             db.commit()
+        # Обновляем состояние задачи Celery с информацией об ошибке
+        self.update_state(
+            state=states.FAILURE,
+            meta={
+                'exc_type': type(e).__name__,
+                'exc_message': str(e), # или error_msg
+                'exc_traceback': traceback.format_exc() # Передаем traceback
+            }
+        )
+        raise Ignore() # Не повторять задачу Celery
+    finally:
+         logger.debug(f"Closing DB session for visualization task {self.request.id}")
+         db.close() # Всегда закрываем сессию
 
 # InferenceProcess class (без изменений)
 class InferenceProcess:
@@ -1700,64 +1910,76 @@ async def get_running_models(db: Session = Depends(get_db)): # Добавим DB
     return running_models_list
 
 
-@app.post("/datasets/{dataset_id}/visualize", status_code=202) # без изменений
+@app.post("/datasets/{dataset_id}/visualize", status_code=202)
 async def start_visualization_generation(dataset_id: str, db: Session = Depends(get_db)):
-    # ... (код без изменений) ...
     logger.info(f"Received request to start visualization for dataset_id: {dataset_id}")
-    # Проверка, существует ли датасет
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not dataset:
         logger.warning(f"Dataset {dataset_id} not found for visualization request.")
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    # Проверим статус существующей визуализации, если есть
+    # Ищем существующую запись
     existing_viz = db.query(DatasetVisualization)\
                      .filter(DatasetVisualization.dataset_id == dataset_id)\
                      .order_by(DatasetVisualization.generated_at.desc())\
                      .first()
 
-    # Не перезапускаем, если уже PENDING или RECENTLY SUCCESS? (опционально)
-    if existing_viz and existing_viz.status == "PENDING":
-         # Можно проверить ID задачи Celery, если сохраняли его
-         logger.info(f"Visualization task for dataset {dataset_id} is already pending.")
-         # Возвращаем 200 OK или 202 Accepted? 200 с сообщением, что уже запущено.
-         # Чтобы вернуть task_id, нужно его где-то хранить... Пока просто 200.
-         return Response(status_code=200, content=json.dumps({"message": "Visualization task is already pending."}), media_type="application/json")
-         # raise HTTPException(status_code=409, detail="Visualization task is already pending.") # 409 Conflict
+    # --- Логика перезапуска ---
+    # Можно не перезапускать, если последняя задача PENDING или недавний SUCCESS
+    if existing_viz:
+        if existing_viz.status == "PENDING":
+             # Проверим статус задачи в Celery, если есть task_id
+             if existing_viz.celery_task_id:
+                 task_result = AsyncResult(existing_viz.celery_task_id, app=celery)
+                 if task_result.status in ['PENDING', 'STARTED', 'RETRY']:
+                     logger.info(f"Visualization task {existing_viz.celery_task_id} for dataset {dataset_id} is already running or pending.")
+                     return {"task_id": existing_viz.celery_task_id, "message": "Visualization task is already in progress."}
+                 else:
+                     logger.warning(f"Found PENDING DB record for task {existing_viz.celery_task_id}, but Celery status is {task_result.status}. Will restart.")
+             else:
+                 logger.warning(f"Found PENDING DB record for dataset {dataset_id} but no task_id. Will restart.")
 
-    # Если статус FAILURE или SUCCESS (или нет записи), запускаем новую задачу
+        # Можно добавить проверку на "недавний" SUCCESS, чтобы не перезапускать слишком часто
+        # from datetime import timedelta
+        # if existing_viz.status == "SUCCESS" and (datetime.utcnow() - existing_viz.generated_at) < timedelta(minutes=5):
+        #     logger.info(f"Recent successful visualization found for dataset {dataset_id}. Returning existing data link.")
+        #     # Возвращаем ID существующей задачи (или самой записи), чтобы фронт мог получить данные
+        #     return {"task_id": existing_viz.celery_task_id, "message": "Using recently generated visualization.", "status": "SUCCESS"}
+
+    # --- Запуск новой задачи ---
     logger.info(f"Queueing visualization task for dataset_id: {dataset_id}")
     try:
         task = generate_visualizations_task.delay(dataset_id)
         logger.info(f"Visualization task {task.id} queued successfully for dataset_id: {dataset_id}")
 
-        # Можно обновить/создать запись в DatasetVisualization со статусом PENDING и task_id
+        # Обновляем или создаем запись в БД
         if existing_viz:
             existing_viz.status = "PENDING"
             existing_viz.error_message = None
             existing_viz.visualization_data = None
-            # existing_viz.celery_task_id = task.id # Если добавили поле
-            db.commit()
+            existing_viz.celery_task_id = task.id # Обновляем task_id
+            existing_viz.generated_at = datetime.utcnow() # Обновляем время запуска/попытки
+            logger.debug(f"Updating existing visualization record for dataset {dataset_id} with new task {task.id}")
         else:
-            # Создаем новую запись сразу
             new_viz_entry = DatasetVisualization(
                  dataset_id=dataset_id,
-                 status="PENDING"
-                 # celery_task_id=task.id # Если добавили поле
+                 status="PENDING",
+                 celery_task_id=task.id
             )
             db.add(new_viz_entry)
-            db.commit()
+            logger.debug(f"Creating new visualization record for dataset {dataset_id} with task {task.id}")
 
-
+        db.commit() # Сохраняем изменения
         return {"task_id": task.id, "message": "Visualization task successfully queued."}
+
     except Exception as e:
          logger.error(f"Failed to queue Celery task for visualization: {e}", exc_info=True)
+         db.rollback() # Откатываем изменения в БД
          raise HTTPException(status_code=500, detail="Failed to start visualization task.")
 
 
-@app.get("/datasets/{dataset_id}/visualizations", response_model=Optional[VisualizationDataResponse]) # без изменений
+@app.get("/datasets/{dataset_id}/visualizations", response_model=Optional[VisualizationDataResponse])
 async def get_visualizations(dataset_id: str, db: Session = Depends(get_db)):
-    # ... (код без изменений) ...
     logger.debug(f"Fetching visualization data for dataset_id: {dataset_id}")
     visualization = db.query(DatasetVisualization)\
                       .filter(DatasetVisualization.dataset_id == dataset_id)\
@@ -1766,23 +1988,18 @@ async def get_visualizations(dataset_id: str, db: Session = Depends(get_db)):
 
     if not visualization:
         logger.debug(f"No visualization record found for dataset_id: {dataset_id}")
-        # Важно вернуть null или объект со статусом "NOT_STARTED"?
-        # Возвращаем null, фронтенд поймет, что надо запускать.
         return None
 
-    logger.debug(f"Found visualization record for dataset_id {dataset_id} with status: {visualization.status}")
-    # Используем Pydantic модель для формирования ответа
+    logger.debug(f"Found visualization record for dataset_id {dataset_id} with status: {visualization.status}, task_id: {visualization.celery_task_id}")
     try:
+        # Конвертируем в Pydantic модель (она уже включает celery_task_id)
         return VisualizationDataResponse.from_orm(visualization)
     except ValidationError as e:
-         logger.error(f"Error converting visualization ORM object to Pydantic model for dataset {dataset_id}: {e}")
-         # Возвращаем ошибку или данные как есть? Лучше ошибку.
-         raise HTTPException(status_code=500, detail="Error retrieving visualization data format.")
+        logger.error(f"Error converting visualization ORM object to Pydantic model for dataset {dataset_id}: {e}")
+        raise HTTPException(status_code=500, detail="Error retrieving visualization data format.")
 
-
-@app.get("/visualization_status/{task_id}") # без изменений
+@app.get("/visualization_status/{task_id}")
 async def get_visualization_status(task_id: str):
-     # ... (код без изменений) ...
     logger.debug(f"Checking status for visualization task_id: {task_id}")
     task_result = AsyncResult(task_id, app=celery)
 
@@ -1790,47 +2007,68 @@ async def get_visualization_status(task_id: str):
     result = task_result.result
     error_info = None
 
-    if task_result.failed():
-         status = "FAILURE"
-         if isinstance(result, dict) and 'exc_type' in result and 'exc_message' in result:
-            error_info = {
+    if task_result.state == states.FAILURE: # Используем константы Celery
+        status = "FAILURE"
+        tb = getattr(task_result, 'traceback', None) # Получаем traceback из результата Celery
+
+        # Пытаемся извлечь детали из result, если это dict (как мы задали в задаче)
+        if isinstance(result, dict) and 'exc_type' in result and 'exc_message' in result:
+             error_info = {
                  'type': result.get('exc_type', 'UnknownError'),
                  'message': result.get('exc_message', 'No message'),
-                 'traceback': result.get('exc_traceback', None) # Исправлено имя ключа
+                 'traceback': result.get('exc_traceback', tb) # Используем traceback из словаря, если есть, иначе из Celery
              }
-         elif isinstance(result, Exception):
+        elif isinstance(result, Exception):
              error_info = {
                  'type': type(result).__name__,
                  'message': str(result),
-                 'traceback': getattr(task_result, 'traceback', None)
+                 'traceback': tb
              }
+             # Попытка получить traceback из backend meta (дополнительно)
              if not error_info['traceback'] and hasattr(task_result.backend, 'get_task_meta'):
                   try:
                       meta = task_result.backend.get_task_meta(task_id)
                       error_info['traceback'] = meta.get('traceback')
                   except Exception: pass
-         else:
+        else:
              error_info = {
                  'type': "UnknownError",
                  'message': str(result) if result else "Unknown failure reason",
-                 'traceback': getattr(task_result, 'traceback', None)
+                 'traceback': tb
              }
-         result = None # Очищаем результат при ошибке
+        result = None # Очищаем результат при ошибке
 
-    elif task_result.successful():
+    elif task_result.state == states.SUCCESS:
         status = "SUCCESS"
-        # Проверяем, вернула ли таска словарь с visualization_db_id
+        # Проверка формата результата (опционально)
         if not isinstance(result, dict) or ('visualization_db_id' not in result and 'message' not in result) :
              logger.warning(f"Visualization task {task_id} succeeded but returned unexpected result format: {result}")
-             # Можно вернуть статус SUCCESS, но с предупреждением в result
              # result = {"warning": "Task succeeded but result format is unexpected.", "original_result": result}
+
+    elif task_result.state == states.PENDING:
+         status = "PENDING"
+    elif task_result.state == states.STARTED:
+         status = "STARTED"
+    elif task_result.state == states.RETRY:
+         status = "RETRY"
+    elif task_result.state == states.REVOKED:
+         status = "REVOKED"
+    else:
+         status = task_result.state # Другие возможные статусы
+
+    # Проверка, существует ли задача вообще (может быть удалена из бэкенда)
+    # AsyncResult не всегда надежно это показывает без запроса к backend
+    # Можно добавить явную проверку через backend.get_task_meta, если необходимо
+    # if status == 'PENDING' and not task_result.backend.get_task_meta(task_id):
+    #      status = 'NOT_FOUND' # Или FAILURE с сообщением
+    #      error_info = {'type': 'TaskNotFound', 'message': 'Task ID not found in backend.'}
 
 
     response = {
         "task_id": task_id,
         "status": status,
         "result": result, # Результат только при успехе (или с предупреждением)
-        "error": error_info
+        "error": error_info # Полная информация об ошибке при FAILURE
     }
     logger.debug(f"Status for visualization task {task_id}: Status={response['status']}, Error={response['error'] is not None}")
     return response

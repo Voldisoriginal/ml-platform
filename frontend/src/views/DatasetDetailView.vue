@@ -50,7 +50,7 @@
       </div>
     </div>
 
-    <!-- НОВЫЙ БЛОК: Визуализации -->
+    <!-- БЛОК: Визуализации -->
     <div class="visualization-section">
       <h2>Data Visualization</h2>
 
@@ -76,7 +76,7 @@
       <!-- Сообщение об ошибке -->
       <div v-if="visualizationError && !isLoadingVisualizations" class="error-container visualization-error">
         <Message severity="error" :closable="false">
-          Failed to generate visualizations: {{ visualizationError }}
+          Failed to generate or load visualizations: {{ visualizationError }}
         </Message>
          <Button
           label="Retry Visualization"
@@ -174,7 +174,7 @@
 
                <!-- Chart View (Heatmap) -->
                <div v-if="correlationViewMode === 'chart'" class="chart-container heatmap-chart-container">
-                 <Card class="chart-card single-chart-card"> <!-- Heatmap still makes sense as a single card -->
+                 <Card class="chart-card single-chart-card">
                     <template #title>Correlation Heatmap</template>
                     <template #content>
                         <Chart type="matrix" :data="preparedCorrelationMatrixChartData" :options="correlationMatrixChartOptions" />
@@ -186,10 +186,10 @@
       </TabView>
 
     </div>
-    <!-- КОНЕЦ НОВОГО БЛОКА -->
+    <!-- КОНЕЦ БЛОКА ВИЗУАЛИЗАЦИИ -->
 
 
-    <!-- Старый TabView с Data Card / Training Results -->
+    <!-- Основной TabView с Data Card / Training Results / Running Services -->
     <TabView v-model:activeIndex="activeTabIndex" class="main-tabs">
       <!-- Data Card Tab -->
       <TabPanel header="Data Card">
@@ -217,6 +217,7 @@
           <p v-else-if="!loadingPreview && !previewError">No data preview available or file is empty.</p>
         </div>
       </TabPanel>
+
       <!-- Training Results Tab -->
       <TabPanel header="Training Results">
          <ProgressSpinner v-if="loadingResults" style="width:50px;height:50px" strokeWidth="8" />
@@ -226,12 +227,60 @@
             <DataTable v-else :value="trainingResults" responsiveLayout="scroll" class="p-datatable-striped" sortField="start_time" :sortOrder="-1">
                 <Column field="model_type" header="Model Type" :sortable="true"></Column>
                 <Column field="target_column" header="Target" :sortable="true"> <template #body="{data}"> <Tag :value="data.target_column" /> </template> </Column>
-                <Column header="Metrics"> <template #body="{data}"> <div class="metrics-list"> <span v-for="(value, key) in data.metrics" :key="key" class="metric-chip"> {{ key }}: {{ value.toFixed ? value.toFixed(3) : value }} </span> </div> </template> </Column>
+                <Column header="Metrics"> <template #body="{data}"> <div class="metrics-list"> <span v-for="(value, key) in data.metrics" :key="key" class="metric-chip"> {{ key }}: {{ value?.toFixed ? value.toFixed(3) : value }} </span> </div> </template> </Column> <!-- Добавил проверку на null -->
                 <Column field="start_time" header="Trained On" :sortable="true"> <template #body="{data}"> {{ formatDateTime(data.start_time) }} </template> </Column>
                 <Column header="Actions"> <template #body="{data}"> <Button icon="pi pi-chart-line" class="p-button-sm p-button-info p-button-text" @click="showModelDetails(data)" v-tooltip.top="'View Training Details'" /> <Button icon="pi pi-play" class="p-button-sm p-button-success p-button-text" @click="startInference(data.id)" v-tooltip.top="'Start Inference Service'" :disabled="isModelRunning(data.id)" /> </template> </Column>
              </DataTable>
          </div>
         </TabPanel>
+
+      <!-- *** НОВАЯ ВКЛАДКА: Running Services *** -->
+      <TabPanel header="Running Services">
+         <!-- Индикатор загрузки -->
+         <ProgressSpinner v-if="loadingRunningModels" style="width:50px;height:50px" strokeWidth="8" />
+         <!-- Сообщение об ошибке загрузки -->
+         <div v-else-if="runningModelsError" class="error-message"> Could not load running services status: {{ runningModelsError }} </div>
+         <!-- Сообщение, если нет запущенных сервисов для этого датасета -->
+         <div v-else-if="!runningModelsForThisDataset || runningModelsForThisDataset.length === 0" class="no-data-message">
+              <i class="pi pi-info-circle" style="font-size: 1.5rem; margin-bottom: 0.5rem;"></i> <br>
+              No inference services are currently running for models trained on this dataset.
+          </div>
+         <!-- Таблица с запущенными сервисами -->
+         <DataTable v-else :value="runningModelsForThisDataset" responsiveLayout="scroll" class="p-datatable-striped p-datatable-sm">
+            <Column field="model_type" header="Model Type" :sortable="true"></Column>
+            <Column field="target_column" header="Target" :sortable="true">
+                 <template #body="{data}"> <Tag :value="data.target_column" /> </template>
+            </Column>
+            <!-- Можно добавить метрики, если они полезны здесь
+             <Column header="Metrics"> <template #body="{data}"> <div class="metrics-list"> <span v-for="(value, key) in data.metrics" :key="key" class="metric-chip"> {{ key }}: {{ value?.toFixed ? value.toFixed(3) : value }} </span> </div> </template> </Column> -->
+            <Column header="API Endpoint">
+                <template #body="{data}">
+                    <code>/predict/{{ data.model_id }}</code>
+                 </template>
+             </Column>
+            <Column header="Actions" style="min-width: 10rem;">
+                <template #body="{data}">
+                     <!-- Кнопка для перехода к документации API -->
+                    <Button
+                        icon="pi pi-book"
+                        class="p-button-sm p-button-secondary p-button-text"
+                        @click="goToApiDocs(data.model_id)"
+                        v-tooltip.top="'View API Docs (Swagger)'"
+                     />
+                     <!-- Кнопка для остановки сервиса -->
+                    <Button
+                        icon="pi pi-stop-circle"
+                        class="p-button-sm p-button-danger p-button-text"
+                        @click="stopInferenceService(data.model_id)"
+                        :loading="isStoppingService[data.model_id]"
+                        v-tooltip.top="'Stop Inference Service'"
+                     />
+                 </template>
+             </Column>
+         </DataTable>
+      </TabPanel>
+      <!-- *** КОНЕЦ НОВОЙ ВКЛАДКИ *** -->
+
     </TabView>
 
     <!-- Model Details Dialog -->
@@ -240,6 +289,7 @@
         <div class="detail-grid">
             <div class="detail-item"><label>Model ID:</label> <span>{{ selectedModel.id }}</span></div>
             <div class="detail-item"><label>Model Type:</label> <span>{{ selectedModel.model_type }}</span></div>
+            <div class="detail-item"><label>Task Type:</label> <span>{{ selectedModel.task_type || 'N/A' }}</span></div>
             <div class="detail-item"><label>Dataset:</label> <span>{{ formatFilename(selectedModel.dataset_filename) }}</span></div>
             <div class="detail-item"><label>Target Column:</label> <span>{{ selectedModel.target_column }}</span></div>
             <div class="detail-item"><label>Training Date:</label> <span>{{ formatDateTime(selectedModel.start_time) }}</span></div>
@@ -253,7 +303,7 @@
          <h3>Metrics</h3>
         <div class="metrics-grid-dialog">
           <div v-for="(value, key) in selectedModel.metrics" :key="key" class="metric-card-dialog" >
-            <div class="metric-title-dialog">{{ key }}</div> <div class="metric-value-dialog">{{ value.toFixed ? value.toFixed(4) : value }}</div>
+            <div class="metric-title-dialog">{{ key }}</div> <div class="metric-value-dialog">{{ value?.toFixed ? value.toFixed(4) : value }}</div> <!-- Добавил проверку на null -->
           </div>
         </div>
       </div>
@@ -284,16 +334,16 @@ import Tag from 'primevue/tag';
 import ProgressSpinner from 'primevue/progressspinner';
 import Dialog from 'primevue/dialog';
 import Message from 'primevue/message';
-import Chart from 'primevue/chart'; // Import Chart
-import Card from 'primevue/card'; // Import Card
-import Toast from 'primevue/toast'; // Import Toast
+import Chart from 'primevue/chart';
+import Card from 'primevue/card';
+import Toast from 'primevue/toast';
+import SelectButton from 'primevue/selectbutton';
 import Tooltip from 'primevue/tooltip'; // Import directive
-import SelectButton from 'primevue/selectbutton'; // Import SelectButton
 
 // Directives need to be registered if not done globally
 const vTooltip = Tooltip;
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'; // Use env var
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 const route = useRoute();
 const router = useRouter();
 const toast = useToast();
@@ -302,31 +352,34 @@ const toast = useToast();
 const dataset = ref(null);
 const trainingResults = ref([]);
 const filePreview = ref([]);
-const columnInfo = ref([]); // { name: 'col1', type: 'int64' }
-const runningModels = ref([]); // Track running inference models
+const columnInfo = ref([]);
+const runningModels = ref([]); // Global list of all running models
 const loadingDataset = ref(true);
 const loadingResults = ref(false);
 const loadingPreview = ref(false);
+const loadingRunningModels = ref(false); // Loading state for running models
 const error = ref(null);
 const trainingResultsError = ref(null);
 const previewError = ref(null);
+const runningModelsError = ref(null); // Error state for running models
 const activeTabIndex = ref(0); // Index for main tabs
 const shareMenu = ref();
 const showDetailsDialog = ref(false);
 const selectedModel = ref(null);
+const isStoppingService = ref({}); // { model_id: true/false }
 
 const datasetId = computed(() => route.params.datasetId);
 
-// --- NEW State for Visualization ---
+// --- State for Visualization ---
 const visualizationData = ref(null); // { histograms: [], boxplots: [], correlation_matrix: {} }
 const isLoadingVisualizations = ref(false);
 const isStartingVisualization = ref(false); // Separate flag for button loading state
 const visualizationError = ref(null);
 const activeVisualizationTabIndex = ref(0); // Index for visualization tabs
 const pollingIntervalId = ref(null); // ID for polling interval
-const currentVisualizationTaskId = ref(null); // ID of the running visualization task
+const currentVisualizationTaskId = ref(null); // ID of the running/pending visualization task for *this* dataset
 
-// --- NEW State for View Toggles ---
+// --- State for View Toggles ---
 const boxplotViewMode = ref('stats'); // 'stats' or 'chart'
 const boxplotViewOptions = ref([
     {label: 'Statistics', value: 'stats'},
@@ -346,56 +399,51 @@ const shareMenuItems = ref([
     command: () => shareDataset()
   },
   // TODO: Add Delete Dataset option here?
-  // { separator: true },
-  // {
-  //   label: 'Delete Dataset',
-  //   icon: 'pi pi-trash',
-  //   command: () => deleteCurrentDataset() // Need to implement this
-  // }
 ]);
 
 // --- Methods ---
 
 const goToTrain = (datasetId)=>{
-  // Navigate to the main page (assuming it's '/') and pass dataset ID as query param
   router.push({ path: '/', query: { dataset: datasetId } });
 };
 
 const fetchDatasetDetails = async (id) => {
   loadingDataset.value = true;
   error.value = null;
-  dataset.value = null; // Clear previous data
+  // Reset all states
+  dataset.value = null;
   filePreview.value = [];
   columnInfo.value = [];
   trainingResults.value = [];
-  // Clear visualization state too when fetching new dataset details
+  runningModels.value = [];
   visualizationData.value = null;
   visualizationError.value = null;
   isLoadingVisualizations.value = false;
-  stopPolling(); // Stop any polling from previous dataset
+  runningModelsError.value = null;
+  previewError.value = null;
+  trainingResultsError.value = null;
+  stopPolling(); // Stop any previous visualization polling
 
   try {
     const response = await axios.get(`${API_BASE_URL}/dataset/${id}`);
     dataset.value = response.data;
 
-     // Process column types if available
+     // Process column types
      if (dataset.value.column_types) {
          columnInfo.value = Object.entries(dataset.value.column_types).map(([name, type]) => ({ name, type }));
      } else if (dataset.value.columns) {
          columnInfo.value = dataset.value.columns.map(name => ({ name, type: 'Unknown' }));
      }
 
-    // Fetch related data only if dataset loaded successfully
     if (dataset.value?.filename) {
-      // Fetch these concurrently
+      // Fetch related data concurrently
       await Promise.all([
         fetchTrainingResults(dataset.value.filename),
         fetchDatasetPreview(dataset.value.filename),
-        fetchRunningModels(),
-        fetchVisualizations() // Fetch existing visualizations on load
+        fetchRunningModels(), // Fetch *all* running models globally
+        fetchVisualizations() // Fetch visualization status/data *for this* dataset
       ]);
     } else if (!dataset.value) {
-        // Handle case where API returned success but no data (shouldn't happen with 404 handling)
          error.value = "Received empty dataset details from server.";
     }
 
@@ -458,14 +506,19 @@ const fetchDatasetPreview = async (filename) => {
   }
 };
 
+// Fetches ALL running models
 const fetchRunningModels = async () => {
+    loadingRunningModels.value = true;
+    runningModelsError.value = null;
     try {
         const response = await axios.get(`${API_BASE_URL}/running_models/`);
-        runningModels.value = response.data;
+        runningModels.value = response.data || []; // Ensure it's an array
     } catch (error) {
         console.error('Failed to fetch running models status:', error);
-        // Non-critical error, maybe show a small warning?
-        // toast.add({ severity: 'warn', summary: 'Network Issue', detail: 'Could not fetch running model status.', life: 2000 });
+        runningModelsError.value = `Could not fetch running model status: ${error.message}`;
+        runningModels.value = []; // Clear on error
+    } finally {
+        loadingRunningModels.value = false;
     }
 };
 
@@ -477,7 +530,9 @@ const downloadDataset = async (filename) => {
     const url = window.URL.createObjectURL(new Blob([response.data]));
     const link = document.createElement('a');
     link.href = url;
-    link.setAttribute('download', filename.split('_').slice(1).join('_') || filename); // Use original filename if possible
+    // Try to extract original filename (after UUID_)
+    const originalFilename = filename.includes('_') ? filename.split('_').slice(1).join('_') : filename;
+    link.setAttribute('download', originalFilename || filename);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -495,7 +550,7 @@ const shareDataset = () => {
     toast.add({ severity: 'success', summary: 'Success', detail: 'Link copied to clipboard!', life: 3000 });
   }, (err) => {
     console.error('Could not copy text: ', err);
-    toast.add({ severity: 'warn', summary: 'Warning', detail: 'Could not copy link automatically. You can copy it from the address bar.', life: 5000 });
+    toast.add({ severity: 'warn', summary: 'Warning', detail: 'Could not copy link automatically.', life: 5000 });
   });
 };
 
@@ -503,6 +558,7 @@ const toggleShareMenu = (event) => {
   shareMenu.value.toggle(event);
 };
 
+// Used in Training Results tab
 const startInference = async (modelId) => {
   try {
     const response = await axios.post(`${API_BASE_URL}/start_inference/${modelId}`);
@@ -512,7 +568,7 @@ const startInference = async (modelId) => {
       detail: `Model ${modelId} inference service started. Status: ${response.data.status}`,
       life: 4000
     });
-    // Refresh running models status after a short delay to allow backend to update
+    // Refresh running models status after a short delay
     setTimeout(fetchRunningModels, 1000);
   } catch (error) {
     console.error('Error starting inference:', error);
@@ -525,186 +581,296 @@ const startInference = async (modelId) => {
   }
 };
 
+// Used in Running Services tab
+const stopInferenceService = async (modelId) => {
+    if (!modelId) return;
+    isStoppingService.value[modelId] = true; // Show loader on button
+    try {
+        await axios.delete(`${API_BASE_URL}/stop_inference/${modelId}`);
+        toast.add({
+            severity: 'success',
+            summary: 'Service Stopped',
+            detail: `Inference service for model ${modelId} stopped.`,
+            life: 3000
+        });
+        // Refresh the list of running models
+        await fetchRunningModels();
+    } catch (error) {
+         console.error('Error stopping inference service:', error);
+         toast.add({
+            severity: 'error',
+            summary: 'Error Stopping Service',
+            detail: `Failed to stop service: ${error.response?.data?.detail || error.message}`,
+            life: 5000
+        });
+    } finally {
+         isStoppingService.value[modelId] = false; // Hide loader
+    }
+};
+
+// Used in Running Services tab
+const goToApiDocs = (modelId) => {
+    if (!modelId) return;
+    // Construct URL for Swagger UI - adjust path if your setup is different
+    const swaggerPath = `/docs#/default/predict_endpoint_predict__model_id__post`.replace('{model_id}', modelId);
+    // Use API_BASE_URL, removing potential trailing /api/v1 or similar if needed
+    const baseUrl = API_BASE_URL.replace(/\/api(\/v\d+)?$/, '');
+    const fullUrl = `${baseUrl}${swaggerPath}`;
+    window.open(fullUrl, '_blank'); // Open in new tab
+};
+
+
 const showModelDetails = (model) => {
   selectedModel.value = model;
   showDetailsDialog.value = true;
 };
 
 const goBack = () => {
-    router.push({ name: 'Datasets' }); // Assumes you have a route named 'Datasets' for the list view
+    router.push({ name: 'Datasets' }); // Assumes a route named 'Datasets'
 }
 
+// Used in Training Results tab to disable "Start" button
 const isModelRunning = (modelId) => {
-    // Check against the fetched runningModels list
     return runningModels.value.some(m => m.model_id === modelId && m.status === 'running');
 };
 
-// --- NEW Visualization Methods ---
+// --- Visualization Methods ---
 
 const fetchVisualizations = async () => {
   if (!datasetId.value) return;
-  // Don't set isLoadingVisualizations here initially, let the caller handle overall loading state
-  // Only manage error/data state specific to visualization fetching
+
   visualizationError.value = null;
-  visualizationData.value = null; // Clear old data first
+  // Don't set isLoadingVisualizations initially, let polling or final status control it.
 
   try {
     const response = await axios.get(`${API_BASE_URL}/datasets/${datasetId.value}/visualizations`);
+    const vizRecord = response.data; // This is the VisualizationDataResponse or null
 
-    if (response.data) {
-        const vizResult = response.data;
-        if (vizResult.status === 'SUCCESS') {
-            visualizationData.value = vizResult.visualization_data;
-            // Reset view modes to default when new data arrives
+    if (vizRecord) {
+        console.log("Fetched visualization record:", vizRecord);
+        const taskIdFromRecord = vizRecord.celery_task_id;
+
+        if (vizRecord.status === 'SUCCESS') {
+            visualizationData.value = vizRecord.visualization_data;
+            visualizationError.value = null;
+            isLoadingVisualizations.value = false; // Success, hide loader
+            stopPolling();
+            currentVisualizationTaskId.value = null; // Task completed
             boxplotViewMode.value = 'stats';
             correlationViewMode.value = 'table';
-            console.log("Fetched existing visualizations:", visualizationData.value);
-        } else if (vizResult.status === 'PENDING') {
-             console.warn("Visualization task is currently pending. Showing loading state.");
-             isLoadingVisualizations.value = true; // Show loader if task is pending from previous run
-             // Optional: Attempt to find the task ID if backend provides it
-             // currentVisualizationTaskId.value = vizResult.task_id; // Assuming backend adds task_id here
-             // if(currentVisualizationTaskId.value) startPolling(currentVisualizationTaskId.value);
-        } else if (vizResult.status === 'FAILURE') {
-            visualizationError.value = vizResult.error_message || 'Unknown error during previous visualization attempt.';
-            console.error("Found failed visualization attempt:", vizResult);
+        } else if (vizRecord.status === 'FAILURE') {
+            visualizationError.value = vizRecord.error_message || 'Unknown error during previous visualization attempt.';
+            visualizationData.value = null;
+            isLoadingVisualizations.value = false; // Failure, hide loader
+            stopPolling();
+            currentVisualizationTaskId.value = null; // Task completed (failed)
+            console.error("Found failed visualization attempt:", vizRecord);
+        } else if (vizRecord.status === 'PENDING') {
+            visualizationData.value = null; // Clear old data
+            visualizationError.value = null;
+            isLoadingVisualizations.value = true; // Show loader
+            if (taskIdFromRecord) {
+                console.log(`Found PENDING visualization with Task ID: ${taskIdFromRecord}. Starting/continuing polling.`);
+                currentVisualizationTaskId.value = taskIdFromRecord; // Set as the task to poll
+                startPolling(taskIdFromRecord);
+            } else {
+                 console.error("Found PENDING visualization record but no Task ID. Cannot poll status.");
+                 visualizationError.value = "Visualization is pending, but its task ID is missing. Please retry.";
+                 isLoadingVisualizations.value = false;
+                 stopPolling();
+                 currentVisualizationTaskId.value = null;
+            }
         } else {
-            // Handle potential other statuses if the backend adds them
-             console.log(`Visualization record found with status: ${vizResult.status}. Treating as not ready.`);
-             visualizationData.value = null; // Show 'Visualize' button if status isn't SUCCESS
+            // Unknown status
+            console.warn(`Visualization record found with unexpected status: ${vizRecord.status}.`);
+            visualizationData.value = null;
+            visualizationError.value = null;
+            isLoadingVisualizations.value = false;
+            stopPolling();
+            currentVisualizationTaskId.value = null;
         }
     } else {
-         console.log("No existing visualization data found (API returned null/empty).");
-         // This means no visualization has been generated or saved successfully yet.
+         // No visualization record found
+         console.log("No existing visualization record found for this dataset.");
          visualizationData.value = null;
+         visualizationError.value = null;
+         isLoadingVisualizations.value = false;
+         stopPolling();
+         currentVisualizationTaskId.value = null;
     }
   } catch (error) {
+    console.error('Error fetching visualization data:', error);
     if (error.response && error.response.status === 404) {
-         console.log("No visualization record found (404). Will show 'Visualize' button.");
-         visualizationData.value = null; // Ensure button is shown
+         console.log("No visualization record found (404).");
+         visualizationData.value = null;
+         visualizationError.value = null;
     } else {
-        console.error('Error fetching visualization data:', error);
-        visualizationError.value = `Could not load existing visualizations: ${error.message}`;
+        visualizationError.value = `Could not load visualization status: ${error.message}`;
+        visualizationData.value = null;
     }
+    isLoadingVisualizations.value = false;
+    stopPolling();
+    currentVisualizationTaskId.value = null;
   }
-  // Note: isLoadingVisualizations is NOT set to false here generally.
-  // It's controlled by the main fetchDatasetDetails or the polling process.
-  // If we reach here *without* finding a PENDING task, *then* we can potentially set it false.
-  if (!isLoadingVisualizations.value && !pollingIntervalId.value) {
-      // If not already loading (due to PENDING) and not polling, hide loader
-  }
-  // The main loader (loadingDataset) will handle the overall page state.
 };
 
 
 const startVisualization = async () => {
   if (!datasetId.value) return;
 
-  isStartingVisualization.value = true; // Button loader
-  isLoadingVisualizations.value = true; // Main section loader/overlay
+  isStartingVisualization.value = true;
+  isLoadingVisualizations.value = true; // Show main loader
   visualizationError.value = null;
-  visualizationData.value = null; // Clear previous results
-  stopPolling(); // Stop any previous polling
+  visualizationData.value = null;
+  stopPolling(); // Stop previous polling if any
 
   try {
     const response = await axios.post(`${API_BASE_URL}/datasets/${datasetId.value}/visualize`);
-    currentVisualizationTaskId.value = response.data.task_id;
+    const newTaskId = response.data.task_id;
+    currentVisualizationTaskId.value = newTaskId; // Set the NEW task ID
     toast.add({ severity: 'info', summary: 'Processing', detail: 'Visualization generation started...', life: 3000 });
-    startPolling(currentVisualizationTaskId.value); // Start polling status
+    startPolling(newTaskId); // Start polling for the NEW task
 
   } catch (error) {
     console.error('Error starting visualization task:', error);
     visualizationError.value = `Failed to start visualization: ${error.response?.data?.detail || error.message}`;
     isLoadingVisualizations.value = false; // Hide loader on startup error
+    stopPolling();
+    currentVisualizationTaskId.value = null; // Reset task ID on failure to start
     toast.add({ severity: 'error', summary: 'Error', detail: visualizationError.value, life: 5000 });
   } finally {
-    isStartingVisualization.value = false; // Remove button loader regardless of outcome
+    isStartingVisualization.value = false; // Remove button loader
   }
 };
 
 const pollVisualizationStatus = async (taskId) => {
+  // Ensure we are still supposed to poll this task
   if (!taskId || taskId !== currentVisualizationTaskId.value || !pollingIntervalId.value) {
-      console.log(`Polling stopped or task ID changed. Ignoring poll for ${taskId}. Current task: ${currentVisualizationTaskId.value}, Interval: ${pollingIntervalId.value}`);
-      return; // Stop if polling was cancelled or task ID changed
+      console.log(`Polling check: Stop condition met. TaskId=${taskId}, Current=${currentVisualizationTaskId.value}, IntervalId=${pollingIntervalId.value}`);
+      // Don't stop polling here necessarily, the check in setInterval will handle it if task ID changed
+      if (!pollingIntervalId.value) { // Stop only if interval was cleared elsewhere
+          console.log("Polling interval already cleared.");
+      }
+      return;
   }
 
+  console.log(`Polling status for task ${taskId}...`);
   try {
     const response = await axios.get(`${API_BASE_URL}/visualization_status/${taskId}`);
-    const { status, error } = response.data;
+    const { status, error: errorInfo, result } = response.data;
 
-    console.log(`Polling task ${taskId}, status: ${status}`);
+    console.log(`Task ${taskId} status: ${status}`);
+
+    // Check again if the task ID is still the current one *after* the API call returns
+    if (taskId !== currentVisualizationTaskId.value) {
+        console.log(`Polling result received for ${taskId}, but current task is now ${currentVisualizationTaskId.value}. Ignoring result.`);
+        return; // Avoid race conditions if user clicked "Retry" quickly
+    }
 
     if (status === 'SUCCESS') {
       stopPolling();
       toast.add({ severity: 'success', summary: 'Success', detail: 'Visualizations generated!', life: 3000 });
-      isLoadingVisualizations.value = false; // Hide loader *before* fetching final data
-      // IMPORTANT: Fetch the *final* data from the dedicated endpoint
-      await fetchVisualizations(); // This will update visualizationData.value
+      // Fetch the final data using the main fetch function which handles UI state
+      await fetchVisualizations(); // This will set data, hide loader, clear task ID
 
     } else if (status === 'FAILURE') {
       stopPolling();
-      const errorMessage = error?.exc_message || error?.error_message || 'Unknown error during visualization task.';
-      console.error('Visualization task failed:', error);
+      let errorMessage = 'Visualization task failed.';
+      if (errorInfo) {
+          errorMessage = `${errorInfo.type || 'Error'}: ${errorInfo.message || 'Unknown reason'}`;
+          console.error('Visualization task failed:', errorInfo);
+          // if (errorInfo.traceback) console.error("Traceback:\n", errorInfo.traceback);
+      }
       visualizationError.value = errorMessage;
+      isLoadingVisualizations.value = false; // Hide loader
+      currentVisualizationTaskId.value = null; // Task completed (failed)
       toast.add({ severity: 'error', summary: 'Visualization Failed', detail: errorMessage, life: 6000 });
-      isLoadingVisualizations.value = false; // Hide loader on failure
 
     } else if (status === 'PENDING' || status === 'STARTED' || status === 'RETRY') {
-      // Continue polling, keep loader active
+      // Task still running, ensure loader is visible
       isLoadingVisualizations.value = true;
     } else {
+         // Unknown status
          console.warn(`Unknown task status received: ${status}. Stopping poll.`);
          stopPolling();
          visualizationError.value = `Received an unexpected status: ${status}`;
          isLoadingVisualizations.value = false;
+         currentVisualizationTaskId.value = null;
     }
   } catch (err) {
     console.error('Error polling visualization status:', err);
-    // Consider adding a counter to stop after N failed attempts
-    // toast.add({ severity: 'warn', summary: 'Polling Error', detail: 'Could not check visualization status.', life: 2000 });
-    // If the error indicates the task ID is gone (e.g., 404), stop polling
-    if (err.response && err.response.status === 404) {
-        console.error(`Task ${taskId} not found during polling. Stopping poll.`);
-        stopPolling();
-        visualizationError.value = `Visualization task ${taskId} could not be found. It might have expired or failed silently.`;
-        isLoadingVisualizations.value = false;
+    // Check if task ID changed during error handling
+     if (taskId !== currentVisualizationTaskId.value) {
+        console.log(`Polling error occurred for ${taskId}, but current task is now ${currentVisualizationTaskId.value}. Ignoring error.`);
+        return;
     }
-    // Otherwise, let it retry on the next interval for transient network issues
+
+    if (err.response && err.response.status === 404) {
+        console.error(`Task ${taskId} not found during polling (404). Stopping poll.`);
+        stopPolling();
+        visualizationError.value = `Visualization task ${taskId} could not be found. It may have expired or failed. Please try again.`;
+        isLoadingVisualizations.value = false;
+        currentVisualizationTaskId.value = null; // Clear invalid task ID
+    } else {
+         // Other network errors - show warning, but let polling continue
+         toast.add({ severity: 'warn', summary: 'Polling Error', detail: 'Could not check visualization status. Retrying...', life: 2000 });
+    }
   }
 };
 
 
 const startPolling = (taskId) => {
   if (!taskId) return;
-  stopPolling(); // Ensure no duplicate intervals
-  currentVisualizationTaskId.value = taskId; // Store current task ID
+  stopPolling(); // Clear previous interval just in case
+
+  console.log(`Starting polling for visualization task: ${taskId}`);
+  // currentVisualizationTaskId is already set by the caller (startVisualization or fetchVisualizations)
   isLoadingVisualizations.value = true; // Show loader
 
-  // Initial check immediately after a short delay
-  setTimeout(() => pollVisualizationStatus(taskId), 1000);
+  // Immediate check after 1s
+  setTimeout(() => {
+      if (taskId === currentVisualizationTaskId.value) { // Check if still relevant
+          pollVisualizationStatus(taskId);
+      }
+  }, 1000);
 
   // Set interval
   pollingIntervalId.value = setInterval(() => {
-    pollVisualizationStatus(taskId);
-  }, 5000); // Poll every 5 seconds
-  console.log(`Polling started for task ${taskId} with interval ID ${pollingIntervalId.value}`);
+      if (taskId === currentVisualizationTaskId.value) { // Check if still relevant
+          pollVisualizationStatus(taskId);
+      } else {
+          // Task ID changed, stop this specific interval
+          console.log(`Polling interval: Task ID changed from ${taskId} to ${currentVisualizationTaskId.value}. Stopping interval ${pollingIntervalId.value}.`);
+          clearInterval(pollingIntervalId.value); // Stop this interval instance
+           // Check if the stopped interval was the 'active' one
+          if (pollingIntervalId.value === Number(pollingIntervalId.value)) { // A bit hacky check if it's the one we stored
+             pollingIntervalId.value = null;
+          }
+      }
+  }, 5000);
 };
 
 const stopPolling = () => {
-  if (pollingIntervalId.value) {
+  if (pollingIntervalId.value !== null) {
     clearInterval(pollingIntervalId.value);
-     console.log(`Polling interval ${pollingIntervalId.value} cleared for task ${currentVisualizationTaskId.value}`);
+    console.log(`Polling interval ${pollingIntervalId.value} cleared.`);
     pollingIntervalId.value = null;
-    // Don't clear currentVisualizationTaskId here, poll might still be in flight or result needed
   }
-  // Important: Do NOT set isLoadingVisualizations = false here. Let the final poll status handle it.
+  // Don't change isLoadingVisualizations or currentVisualizationTaskId here
 };
 
 
-// --- Computed & Watchers ---
+// --- Computed Properties ---
+
+const runningModelsForThisDataset = computed(() => {
+    if (!dataset.value || !dataset.value.filename || !runningModels.value) {
+        return [];
+    }
+    // Filter the global list for models matching the current dataset's filename
+    return runningModels.value.filter(model => model.dataset_filename === dataset.value.filename && model.status === 'running');
+});
 
 const getImageUrl = (ds) => {
-    // ... (keep existing implementation)
     if (ds?.imageUrl) {
         if (ds.imageUrl.startsWith('http://') || ds.imageUrl.startsWith('https://')) {
             return ds.imageUrl;
@@ -718,39 +884,46 @@ const getImageUrl = (ds) => {
 };
 
 const formattedDate = (dateString) => {
-    // ... (keep existing implementation)
   if (!dateString) return 'N/A';
-  return new Date(dateString).toLocaleDateString(undefined, {
-      year: 'numeric', month: 'long', day: 'numeric'
-  });
+  try {
+      return new Date(dateString).toLocaleDateString(undefined, {
+          year: 'numeric', month: 'long', day: 'numeric'
+      });
+  } catch (e) {
+      return 'Invalid Date';
+  }
 };
 
 const formatDateTime = (dateString) => {
-    // ... (keep existing implementation)
     if (!dateString) return 'N/A';
-    return new Date(dateString).toLocaleString(undefined, {
-        year: 'numeric', month: 'numeric', day: 'numeric',
-        hour: '2-digit', minute: '2-digit'
-    });
+    try {
+        return new Date(dateString).toLocaleString(undefined, {
+            year: 'numeric', month: 'numeric', day: 'numeric',
+            hour: '2-digit', minute: '2-digit'
+        });
+     } catch (e) {
+      return 'Invalid DateTime';
+    }
 };
 
 const formatFileSize = (bytes) => {
-    // ... (keep existing implementation)
+  if (bytes === null || bytes === undefined || bytes < 0) return 'N/A';
   if (bytes === 0) return '0 Bytes';
-  if (!bytes || bytes < 0) return 'N/A';
   const k = 1024;
   const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
-  const index = Math.min(i, sizes.length - 1);
+  const index = Math.min(i, sizes.length - 1); // Ensure index is within bounds
+  // Handle potential division by zero or log(0) if index calculation goes wrong
+  if (index < 0) return 'N/A';
   return parseFloat((bytes / Math.pow(k, index)).toFixed(2)) + ' ' + sizes[index];
 };
 
 const formatFilename = (filename) => {
-    // ... (keep existing implementation)
-    return filename?.replace(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}_/, '') || filename || 'N/A';
+    // Removes UUID prefix if present
+    return filename?.replace(/^[a-f0-9]{8}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{12}_/, '') || filename || 'N/A';
 };
 
-// --- NEW/MODIFIED Computed Properties for Charts ---
+// --- Chart Data Preparation (Computed) ---
 
 const preparedHistograms = computed(() => {
   if (!visualizationData.value?.histograms) return [];
@@ -798,8 +971,7 @@ const preparedHistograms = computed(() => {
   });
 });
 
-// NEW: Computed property for Box Plot Chart Data
-// NEW: Computed property for INDIVIDUAL Box Plot Charts
+
 const preparedIndividualBoxplots = computed(() => {
     const boxplotData = visualizationData.value?.boxplots;
     if (!boxplotData || boxplotData.length === 0) {
@@ -876,13 +1048,20 @@ const preparedIndividualBoxplots = computed(() => {
 });
 
 
-// MODIFIED: For Correlation Table (no functional change, just context)
 const preparedCorrelationData = computed(() => {
   const matrix = visualizationData.value?.correlation_matrix;
-  if (!matrix || !matrix.columns || !matrix.data) return [];
-  // ... (keep existing implementation)
+  if (!matrix || !matrix.columns || !matrix.data || matrix.columns.length !== matrix.data.length) {
+       if (matrix && (!matrix.data || matrix.columns?.length !== matrix.data?.length)) {
+            console.warn("Correlation matrix data and columns length mismatch.");
+       }
+       return [];
+  }
+
   return matrix.data.map((row, rowIndex) => {
-    if (rowIndex >= matrix.columns.length) return null;
+    if (rowIndex >= matrix.columns.length || row.length !== matrix.columns.length) {
+         console.warn(`Correlation matrix row ${rowIndex} length mismatch or index out of bounds.`);
+         return null;
+    };
     const rowData = { column: matrix.columns[rowIndex] };
     row.forEach((value, colIndex) => {
        if (colIndex < matrix.columns.length) {
@@ -890,15 +1069,19 @@ const preparedCorrelationData = computed(() => {
        }
     });
     return rowData;
-  }).filter(row => row !== null);
+  }).filter(Boolean); // Remove nulls if any row had issues
 });
 
 
-// NEW: Computed property for Correlation Matrix Chart Data
 const preparedCorrelationMatrixChartData = computed(() => {
   const matrix = visualizationData.value?.correlation_matrix;
   if (!matrix || !matrix.columns || !matrix.data || matrix.columns.length < 2) {
     return { datasets: [] };
+  }
+  // Add validation for matrix dimensions
+  if (matrix.columns.length !== matrix.data.length || !matrix.data.every(row => row.length === matrix.columns.length)) {
+      console.error("Correlation matrix dimensions are inconsistent.");
+      return { datasets: [] };
   }
 
   const labels = matrix.columns;
@@ -907,151 +1090,126 @@ const preparedCorrelationMatrixChartData = computed(() => {
     const yLabel = labels[i];
     row.forEach((value, j) => {
        const xLabel = labels[j];
-       // Add data point if value is valid (not NaN, maybe handle nulls?)
+       // Ensure value is a valid number for the heatmap
        if (value !== null && value !== undefined && !isNaN(value)) {
-         data.push({
-           x: xLabel,
-           y: yLabel,
-           v: value // 'v' is the common property name for value in matrix charts
-         });
+         data.push({ x: xLabel, y: yLabel, v: value });
+       } else {
+         // Optionally represent NaN/null differently, e.g., with v: null or skip
+         data.push({ x: xLabel, y: yLabel, v: null }); // Use null for coloring
        }
     });
   });
 
   return {
-      // labels: labels, // Labels are typically set on scales for matrix
       datasets: [{
           label: 'Correlation',
           data: data,
-          // Configure appearance within the dataset:
           backgroundColor: function(context) {
              const value = context.dataset.data[context.dataIndex]?.v;
-             if (value === undefined || value === null) return 'rgba(200, 200, 200, 0.5)'; // Gray for missing
-              return getColorForValue(value); // Use helper function for color scale
+             return getColorForValue(value); // Handles null/NaN internally
           },
-          borderColor: 'rgba(0,0,0,0.1)', // Subtle border
+          borderColor: 'rgba(0,0,0,0.1)',
           borderWidth: 1,
-          // Control cell size (adjust as needed)
-          width: ({chart}) => (chart.chartArea?.width ?? 300) / labels.length - 1,
-          height: ({chart}) => (chart.chartArea?.height ?? 300) / labels.length - 1,
+          width: ({chart}) => Math.max(10, (chart.chartArea?.width ?? 300) / labels.length - 1), // Ensure min width
+          height: ({chart}) => Math.max(10, (chart.chartArea?.height ?? 300) / labels.length - 1), // Ensure min height
       }]
   };
 });
 
-// NEW: Helper function for correlation heatmap color scale
 const getColorForValue = (value) => {
-    if (value === null || value === undefined || isNaN(value)) return 'rgba(200, 200, 200, 0.5)'; // Grey for invalid
+    if (value === null || value === undefined || isNaN(value)) return 'rgba(200, 200, 200, 0.5)'; // Grey for invalid/null
 
     // Scale: Strong Red (-1) -> White (0) -> Strong Blue (+1)
     const intensity = Math.abs(value);
     let r, g, b;
-    const whitePoint = 255; // Use pure white for 0
+    const whitePoint = 255;
 
-    if (value > 0) { // Positive correlation (Blue scale: White -> Blue)
-        r = Math.round(whitePoint * (1 - value)); // Decrease R from white
-        g = Math.round(whitePoint * (1 - value)); // Decrease G from white
-        b = whitePoint; // Full Blue
-    } else { // Negative correlation (Red scale: White -> Red)
-        r = whitePoint; // Full Red
-        g = Math.round(whitePoint * (1 + value)); // Decrease G from white (value is negative)
-        b = Math.round(whitePoint * (1 + value)); // Decrease B from white
+    if (value > 0) { // Positive correlation (Blue scale)
+        r = Math.round(whitePoint * (1 - value));
+        g = Math.round(whitePoint * (1 - value));
+        b = whitePoint;
+    } else { // Negative correlation (Red scale)
+        r = whitePoint;
+        g = Math.round(whitePoint * (1 + value));
+        b = Math.round(whitePoint * (1 + value));
     }
 
-    // Ensure colors are within bounds (though should be fine with this logic)
     r = Math.max(0, Math.min(255, r));
     g = Math.max(0, Math.min(255, g));
     b = Math.max(0, Math.min(255, b));
-
-    // Optional: Adjust alpha based on intensity? Currently using solid colors.
-    // const alpha = 0.3 + intensity * 0.7;
-    // return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 
     return `rgb(${r}, ${g}, ${b})`;
 };
 
 
-// NEW: Chart options for Correlation Matrix (Heatmap)
 const correlationMatrixChartOptions = computed(() => {
    const labels = visualizationData.value?.correlation_matrix?.columns ?? [];
+   if (!labels.length) return {}; // Return empty options if no labels
+
    return {
         responsive: true,
-        maintainAspectRatio: false, // Fit container
+        maintainAspectRatio: false,
         scales: {
             x: {
                 type: 'category',
                 labels: labels,
-                position: 'bottom', // or 'top'
-                ticks: {
-                    display: true,
-                    autoSkip: false, // Show all labels
-                    maxRotation: 90, // Rotate if needed
-                    minRotation: 45
-                },
-                grid: {
-                    display: false // Hide grid lines for heatmap look
-                }
+                position: 'bottom',
+                ticks: { display: true, autoSkip: false, maxRotation: 90, minRotation: 45 },
+                grid: { display: false }
             },
             y: {
                 type: 'category',
                 labels: labels,
                 position: 'left',
-                offset: true, // Centers labels between grid lines if grid is shown
-                ticks: {
-                    display: true,
-                    autoSkip: false, // Show all labels
-                },
-                 grid: {
-                    display: false // Hide grid lines
-                },
-                reverse: true // Often looks better with origin at top-left
+                offset: true,
+                ticks: { display: true, autoSkip: false },
+                 grid: { display: false },
+                reverse: true
             }
         },
         plugins: {
-            legend: {
-                display: false // Heatmap color is self-explanatory via tooltip/scale
-            },
+            legend: { display: false },
             tooltip: {
                 callbacks: {
-                    title: function() { return ''; }, // No main title needed
+                    title: function() { return ''; },
                     label: function(context) {
                         const item = context.dataset.data[context.dataIndex];
                         if (!item) return '';
-                        return `Corr(${item.y}, ${item.x}): ${item.v.toFixed(3)}`;
+                        const valueFormatted = (item.v === null || item.v === undefined) ? 'N/A' : item.v.toFixed(3);
+                        return `Corr(${item.y}, ${item.x}): ${valueFormatted}`;
                     }
                 }
             },
-            // Potential future addition: Color scale legend (requires custom plugin or library)
         },
-         // Ensure aspect ratio is somewhat square-ish if desired, but allow stretching
-        aspectRatio: 1, // Try to keep it square, but maintainAspectRatio:false takes precedence
+        aspectRatio: 1,
     };
 });
 
 
 const formatCorrelationValue = (value) => {
-    // ... (keep existing implementation)
     if (value === null || value === undefined || isNaN(value)) return '-';
-    if (value === 1) return '1.00';
-    if (value === -1) return '-1.00';
     return value.toFixed(2);
 };
 
 const getCorrelationCellStyle = (value) => {
-    // Use the same color logic as the heatmap chart for consistency
-    const bgColor = getColorForValue(value);
-    // Determine text color based on background luminance (simple threshold)
-    let textColor = '#000000'; // Default to black
+    const bgColor = getColorForValue(value); // Handles null/NaN
+    let textColor = '#000000'; // Default black
+
      if (value !== null && value !== undefined && !isNaN(value)) {
          const intensity = Math.abs(value);
-         if (intensity > 0.5) { // Use white text on darker colors
+         // Basic luminance check approximation
+         const r = parseInt(bgColor.slice(4, bgColor.indexOf(',')), 10);
+         const g = parseInt(bgColor.slice(bgColor.indexOf(',') + 1, bgColor.lastIndexOf(',')), 10);
+         const b = parseInt(bgColor.slice(bgColor.lastIndexOf(',') + 1, -1), 10);
+         const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+         if (luminance < 0.5) { // If background is dark
               textColor = '#ffffff';
          }
      } else {
          textColor = '#6c757d'; // Grey text for N/A
      }
 
-     // Apply styles directly
-     return { backgroundColor: bgColor, color: textColor };
+     return { backgroundColor: bgColor, color: textColor, textAlign: 'center' };
 };
 
 
@@ -1065,278 +1223,158 @@ onMounted(() => {
         error.value = "No Dataset ID provided in the URL.";
         loadingDataset.value = false;
     }
-
-     // *** IMPORTANT for Chart.js Plugins ***
-     // Ensure plugins are registered globally, typically in main.js or a plugins file:
-     // import { Chart } from 'chart.js';
-     // import { BoxPlotController, BoxAndWiskers } from '@sgratzl/chartjs-chart-boxplot';
-     // import { MatrixController, MatrixElement } from 'chartjs-chart-matrix';
-     // Chart.register(BoxPlotController, BoxAndWiskers, MatrixController, MatrixElement);
-     // If NOT registered globally, you might need to import and register them here,
-     // but global registration is cleaner. This component assumes they ARE registered.
+    // Chart.js plugins should be registered globally (e.g., in main.js)
+    // import { Chart } from 'chart.js';
+    // import { BoxPlotController, BoxAndWiskers } from '@sgratzl/chartjs-chart-boxplot';
+    // import { MatrixController, MatrixElement } from 'chartjs-chart-matrix';
+    // Chart.register(BoxPlotController, BoxAndWiskers, MatrixController, MatrixElement);
 });
 
 onUnmounted(() => {
    console.log("DatasetDetailView Unmounted. Cleaning up polling.");
-   stopPolling(); // Clean up interval timer when component is destroyed
+   stopPolling(); // Clean up interval timer
 });
 
-// Watch for route changes if the user navigates between detail pages directly
+// Watch for route changes
 watch(datasetId, (newId, oldId) => {
   if (newId && newId !== oldId) {
     console.log(`Dataset ID changed from ${oldId} to ${newId}. Refetching data.`);
-    // Reset component state before fetching new data
-    // (fetchDatasetDetails already does most of this)
-    fetchDatasetDetails(newId);
+    fetchDatasetDetails(newId); // Refetch all data for the new dataset ID
   }
 });
 
-// Watch for visualization data changes to potentially reset view modes if needed
+// Watch for visualization data changes
 watch(visualizationData, (newData, oldData) => {
-    if (newData && !oldData) { // When data first loads
+    // Reset view modes when visualization data first loads or changes significantly
+    if (newData && (!oldData || JSON.stringify(newData) !== JSON.stringify(oldData))) {
         boxplotViewMode.value = 'stats';
         correlationViewMode.value = 'table';
     }
-    // Add more complex logic here if needed based on specific data updates
 });
 
 
 </script>
 
 <style scoped>
-/* --- Existing Styles (Keep As Is) --- */
+/* --- Existing Styles (Keep As Is or Adjust) --- */
 .dataset-detail-view {
   padding: 2rem;
-  max-width: 1200px; /* Adjust max-width if needed for wider charts */
+  max-width: 1200px;
   margin: 0 auto;
-  background-color: #f4f7f9;
+  background-color: #f4f7f9; /* Light grey background for the page */
 }
 
-/* Header, Description, Main Tabs, Data Card, Training Results, Dialogs... */
-/* Keep all existing styles for these sections */
-.header-section { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding-bottom: 1.5rem; border-bottom: 1px solid #dee2e6; }
+/* Header */
+.header-section { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding-bottom: 1.5rem; border-bottom: 1px solid #dee2e6; gap: 1rem; flex-wrap: wrap; }
 .header-left .dataset-title { margin: 0 0 0.25rem 0; color: #343a40; font-size: 2rem; font-weight: 600; }
 .header-left .creation-date { font-size: 0.9rem; color: #6c757d; }
-.header-right { display: flex; gap: 0.75rem; align-items: center; }
-.header-right .p-button { transition: background-color 0.2s, color 0.2s, border-color 0.2s; }
+.header-right { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+
+/* Description */
 .description-section { display: flex; flex-wrap: wrap; gap: 2rem; margin-bottom: 2rem; background-color: #ffffff; padding: 1.5rem; border-radius: 8px; align-items: flex-start; border: 1px solid #e9ecef; }
 .image-container { max-width: 300px; width: 100%; flex-shrink: 0; text-align: center; }
-.image-container :deep(img.p-image-preview), .image-container :deep(img) { display: block; max-width: 100%; height: auto; object-fit: contain; max-height: 300px; border-radius: 4px; border: 1px solid #e9ecef; margin: 0 auto; }
+.image-container :deep(img.p-image-preview), .image-container :deep(img) { display: block; max-width: 100%; height: auto; object-fit: contain; max-height: 300px; border-radius: 4px; border: 1px solid #e9ecef; margin: 0 auto; background-color: #f8f9fa; } /* Added background for images */
 .description-content { flex-grow: 1; min-width: 250px; }
 .description-content h2 { margin-top: 0; margin-bottom: 1rem; color: #495057; font-size: 1.5rem; }
 .description-content p { line-height: 1.6; color: #495057; word-break: break-word; }
-.main-tabs { margin-top: 2rem; }
-.main-tabs :deep(.p-tabview-nav) { background: #ffffff; border-bottom: 1px solid #dee2e6; border-radius: 6px 6px 0 0; }
-.main-tabs :deep(.p-tabview .p-tabview-panels) { padding: 1.5rem; background-color: #ffffff; border: 1px solid #dee2e6; border-top: none; border-radius: 0 0 6px 6px; }
-.data-card-content { display: flex; flex-direction: column; gap: 2rem; }
-.data-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem 1.5rem; }
-.info-item { background-color: #f8f9fa; padding: 0.8rem 1rem; border-radius: 4px; border: 1px solid #e9ecef; }
-.info-item label { display: block; font-weight: 600; color: #495057; margin-bottom: 0.4rem; font-size: 0.85rem; text-transform: uppercase; }
-.info-item span, .info-item .p-tag { font-size: 0.95rem; color: #343a40; }
-.info-item .p-tag { vertical-align: middle; }
-.data-card-content h3 { margin-bottom: 1rem; margin-top: 1rem; color: #495057; border-bottom: 1px solid #eee; padding-bottom: 0.5rem; font-size: 1.2rem; }
-.preview-table-detail :deep(.p-datatable-tbody > tr > td) { padding: 0.5rem 0.8rem !important; font-size: 0.9rem; }
-.preview-table-detail :deep(.p-datatable-thead > tr > th) { padding: 0.6rem 0.8rem !important; font-size: 0.9rem; background-color: #e9ecef; }
-.metrics-list { display: flex; flex-wrap: wrap; gap: 0.5rem; }
-.metric-chip { background-color: #e0e0e0; color: #333; padding: 0.3rem 0.7rem; border-radius: 16px; font-size: 0.85rem; white-space: nowrap; box-shadow: 0 1px 2px rgba(0,0,0,0.1); }
-.model-details-dialog { font-size: 0.95rem; }
-.detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem 1.5rem; margin-bottom: 1.5rem; background-color: #f8f9fa; padding: 1.25rem; border-radius: 6px; border: 1px solid #e9ecef; }
-.detail-item label { font-weight: 600; color: #343a40; margin-right: 0.5rem; }
-.params-section { margin-top: 1.5rem; margin-bottom: 1.5rem; }
-.params-section h3 { margin-bottom: 0.75rem; color: #495057; }
-.params-section pre { background-color: #e9ecef; padding: 1rem; border-radius: 4px; max-height: 250px; overflow-y: auto; font-size: 0.85rem; border: 1px solid #dee2e6; }
-.metrics-grid-dialog { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; margin-top: 1rem; }
-.metric-card-dialog { background: #ffffff; padding: 1rem; border-radius: 6px; text-align: center; border: 1px solid #dee2e6; transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out; }
-.metric-card-dialog:hover { transform: translateY(-3px); box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-.metric-title-dialog { font-weight: 600; color: #495057; margin-bottom: 0.5rem; font-size: 0.9rem; }
-.metric-value-dialog { font-size: 1.3rem; color: #007bff; font-weight: 500; }
-.loading-container.main-loading, .error-container.main-error { display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 400px; text-align: center; }
-.loading-container p { margin-top: 1rem; font-size: 1.1rem; color: #6c757d; }
-.error-container .p-message { margin-bottom: 1.5rem; }
-.error-message { color: var(--red-700); background-color: var(--red-100); padding: 1rem; border-radius: 4px; border: 1px solid var(--red-200); margin-top: 1rem; margin-bottom: 1rem; }
-.code-inline { background-color: #e9ecef; padding: 0.1rem 0.3rem; border-radius: 3px; font-family: monospace; font-size: 0.9em; }
 
-
-/* --- Visualization Section Styles (Keep existing) --- */
+/* Visualization Section */
 .visualization-section {
   margin-top: 2.5rem;
   padding: 1.5rem;
-  background-color: #ffffff; /* White background */
+  background-color: #ffffff;
   border-radius: 8px;
   border: 1px solid #e9ecef;
   box-shadow: 0 2px 5px rgba(0,0,0,0.05);
 }
-
-.visualization-section h2 {
-  margin-top: 0;
-  margin-bottom: 1.5rem;
-  color: #495057;
-  border-bottom: 1px solid #eee;
-  padding-bottom: 0.75rem;
-  font-size: 1.5rem;
-}
-
-.start-visualization {
-    text-align: center;
-    padding: 2.5rem 1rem;
-    background-color: #f8f9fa;
-    border-radius: 6px;
-    border: 1px dashed #ced4da;
-}
- .start-visualization p {
-     margin-bottom: 1.5rem;
-     color: #6c757d;
-     font-size: 1.05rem;
- }
- .start-visualization .p-button {
-     padding: 0.8rem 1.5rem;
- }
-
+.visualization-section h2 { margin-top: 0; margin-bottom: 1.5rem; color: #495057; border-bottom: 1px solid #eee; padding-bottom: 0.75rem; font-size: 1.5rem; }
+.start-visualization { text-align: center; padding: 2.5rem 1rem; background-color: #f8f9fa; border-radius: 6px; border: 1px dashed #ced4da; }
+.start-visualization p { margin-bottom: 1.5rem; color: #6c757d; font-size: 1.05rem; }
+.start-visualization .p-button { padding: 0.8rem 1.5rem; }
 .loading-container.visualization-loading,
-.error-container.visualization-error {
-  min-height: 200px;
-  margin-top: 1rem;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  align-items: center;
-  background-color: #f8f9fa;
-  border-radius: 6px;
-  padding: 1rem;
-}
- .loading-container.visualization-loading p {
-     margin-top: 1rem;
-     font-size: 1.1rem;
-     color: #6c757d;
- }
-  .loading-container.visualization-loading small {
-     margin-top: 0.5rem;
-     font-size: 0.9rem;
-     color: #adb5bd;
- }
- .error-container.visualization-error .p-message {
-     width: 80%;
-     max-width: 600px;
-     margin-bottom: 1rem;
- }
+.error-container.visualization-error { min-height: 200px; margin-top: 1rem; display: flex; flex-direction: column; justify-content: center; align-items: center; background-color: #f8f9fa; border-radius: 6px; padding: 1rem; text-align: center; }
+.loading-container.visualization-loading p { margin-top: 1rem; font-size: 1.1rem; color: #6c757d; }
+.loading-container.visualization-loading small { margin-top: 0.5rem; font-size: 0.9rem; color: #adb5bd; }
+.error-container.visualization-error .p-message { width: 80%; max-width: 600px; margin-bottom: 1rem; }
 
+/* Visualization Tabs */
+.visualization-tabs { margin-top: 1.5rem; }
+.visualization-tabs.p-tabview-cards :deep(.p-tabview-nav) { background: #e9ecef; border-radius: 6px 6px 0 0; border-bottom: none; padding: 0.5rem; }
+.visualization-tabs.p-tabview-cards :deep(.p-tabview-nav li .p-tabview-nav-link) { border: none; background: transparent; margin: 0 0.25rem; border-radius: 4px; transition: background-color 0.2s; color: #495057; }
+.visualization-tabs.p-tabview-cards :deep(.p-tabview-nav li:not(.p-highlight) .p-tabview-nav-link:hover) { background: #dee2e6; color: #343a40; }
+.visualization-tabs.p-tabview-cards :deep(.p-tabview-nav li.p-highlight .p-tabview-nav-link) { background: #ffffff; color: var(--primary-color); border-bottom: none; font-weight: 600; }
+.visualization-tabs :deep(.p-tabview-panels) { padding: 1.5rem; background-color: #ffffff; border: 1px solid #e9ecef; border-top: none; border-radius: 0 0 6px 6px; }
 
-.visualization-tabs {
-    margin-top: 1.5rem;
-}
-/* Style for card-like tabs */
-.visualization-tabs.p-tabview-cards :deep(.p-tabview-nav) {
-   background: #e9ecef;
-   border-radius: 6px 6px 0 0;
-   border-bottom: none;
-   padding: 0.5rem;
-}
-.visualization-tabs.p-tabview-cards :deep(.p-tabview-nav li .p-tabview-nav-link) {
-    border: none;
-    background: transparent;
-    margin: 0 0.25rem;
-    border-radius: 4px;
-    transition: background-color 0.2s;
-}
-.visualization-tabs.p-tabview-cards :deep(.p-tabview-nav li:not(.p-highlight) .p-tabview-nav-link:hover) {
-    background: #dee2e6;
-}
-.visualization-tabs.p-tabview-cards :deep(.p-tabview-nav li.p-highlight .p-tabview-nav-link) {
-    background: #ffffff;
-    color: var(--primary-color);
-    border-bottom: none; /* Override default bottom border */
-}
+/* Chart Grid & Cards */
+.charts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem; }
+.charts-grid.stats-view { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.chart-card { border: 1px solid #e9ecef; box-shadow: 0 1px 3px rgba(0,0,0,0.04); transition: box-shadow 0.2s; border-radius: 6px; display: flex; flex-direction: column; background-color: #fff; }
+.chart-card:hover { box-shadow: 0 3px 6px rgba(0,0,0,0.08); }
+.chart-card :deep(.p-card-title) { font-size: 1.1rem; font-weight: 600; margin-bottom: 0; color: #495057; text-align: center; border-bottom: 1px solid #eee; padding: 0.75rem 1rem; background-color: #f8f9fa; border-radius: 6px 6px 0 0; }
+.chart-card :deep(.p-card-content) { padding: 1rem; flex-grow: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 300px; }
+.single-chart-card :deep(.p-card-content) { min-height: 450px; padding: 1.5rem; }
+.chart-card :deep(.p-card-content .p-chart) { width: 100%; height: 100%; }
 
-.visualization-tabs :deep(.p-tabview-panels) {
-  padding: 1.5rem;
-   background-color: #ffffff;
-   border: 1px solid #e9ecef;
-   border-top: none;
-   border-radius: 0 0 6px 6px;
-}
+/* Boxplot Stats View */
+.data-card-simple :deep(.p-card-content) { min-height: auto; padding: 1rem; }
+.stats-list { list-style: none; padding: 0; margin: 0; font-size: 0.95rem; color: #495057; }
+.stats-list li { padding: 0.5rem 0; border-bottom: 1px dashed #eee; display: flex; justify-content: space-between; align-items: center; }
+.stats-list li:last-child { border-bottom: none; }
+.stat-label { color: #6c757d; margin-right: 1rem; }
+.stat-value { font-weight: 500; color: #343a40; }
 
-.charts-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 1.5rem;
-}
-/* Ensure stats view also uses the grid */
-.charts-grid.stats-view {
-    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); /* Maybe slightly smaller cards for stats */
-}
+/* View Toggles */
+.view-toggle-container { display: flex; justify-content: flex-end; margin-bottom: 1.5rem; }
 
+/* Correlation Table */
+.correlation-table-container { overflow-x: auto; } /* Enable horizontal scroll */
+.correlation-table :deep(td),
+.correlation-table :deep(th) { text-align: center !important; padding: 0.6rem 0.4rem !important; font-size: 0.9rem; white-space: nowrap; border: 1px solid #f1f3f5; } /* Lighter borders */
+.correlation-table :deep(th) { background-color: #f8f9fa; font-weight: 600; color: #495057; position: sticky; top: 0; z-index: 1; }
+.correlation-table :deep(td span) { display: inline-block; padding: 0.3rem 0.5rem; border-radius: 4px; min-width: 50px; font-weight: 500; line-height: 1.2; }
+.correlation-table :deep(td:first-child),
+.correlation-table :deep(th:first-child) { text-align: left !important; font-weight: bold; position: sticky; left: 0; z-index: 2; border-right: 2px solid #dee2e6 !important; background-color: #f8f9fa !important; }
+.correlation-table :deep(th:first-child) { z-index: 3; } /* Header corner on top */
 
-.chart-card {
-  border: 1px solid #e9ecef;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
-  transition: box-shadow 0.2s;
-  border-radius: 6px;
-  display: flex; /* Allow content to grow */
-  flex-direction: column; /* Stack title and content */
+/* Main Tabs (Data Card, Training, Running) */
+.main-tabs { margin-top: 2.5rem; }
+.main-tabs :deep(.p-tabview-nav) { background: #ffffff; border-bottom: 1px solid #dee2e6; border-radius: 6px 6px 0 0; }
+.main-tabs :deep(.p-tabview-nav .p-tabview-nav-link) { color: #495057; border-color: transparent; background: transparent;}
+.main-tabs :deep(.p-tabview-nav .p-tabview-nav-link:not(.p-highlight):not(.p-disabled):hover) { background: #f8f9fa; border-color: transparent; color: #343a40;}
+.main-tabs :deep(.p-tabview-nav .p-highlight .p-tabview-nav-link) { background: #ffffff; border-color: var(--primary-color); color: var(--primary-color); border-bottom: 2px solid var(--primary-color); } /* Standard underline style */
+.main-tabs :deep(.p-tabview .p-tabview-panels) { padding: 1.5rem; background-color: #ffffff; border: 1px solid #dee2e6; border-top: none; border-radius: 0 0 6px 6px; }
+
+/* Data Card Content */
+.data-card-content { display: flex; flex-direction: column; gap: 2rem; }
+.data-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem 1.5rem; }
+.info-item { background-color: #f8f9fa; padding: 0.8rem 1rem; border-radius: 4px; border: 1px solid #e9ecef; }
+.info-item label { display: block; font-weight: 600; color: #495057; margin-bottom: 0.4rem; font-size: 0.85rem; text-transform: uppercase; }
+.info-item span, .info-item .p-tag { font-size: 0.95rem; color: #343a40; display: block; overflow: hidden; text-overflow: ellipsis; }
+.info-item .p-tag { vertical-align: middle; }
+.data-card-content h3 { margin-bottom: 1rem; margin-top: 1rem; color: #495057; border-bottom: 1px solid #eee; padding-bottom: 0.5rem; font-size: 1.2rem; }
+.preview-table-detail :deep(.p-datatable-tbody > tr > td) { padding: 0.5rem 0.8rem !important; font-size: 0.9rem; }
+.preview-table-detail :deep(.p-datatable-thead > tr > th) { padding: 0.6rem 0.8rem !important; font-size: 0.9rem; background-color: #e9ecef; }
+
+/* Training Results & Running Services Tabs */
+.metrics-list { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.metric-chip { background-color: #e0e0e0; color: #333; padding: 0.3rem 0.7rem; border-radius: 16px; font-size: 0.85rem; white-space: nowrap; box-shadow: 0 1px 2px rgba(0,0,0,0.1); }
+.main-tabs :deep(.p-tabview-panels .p-datatable td) { /* Ensure vertical align for buttons too */
+    vertical-align: middle;
 }
-.chart-card:hover {
-    box-shadow: 0 3px 6px rgba(0,0,0,0.08);
-}
-.chart-card :deep(.p-card-title) {
-   font-size: 1.1rem;
-   font-weight: 600;
-   margin-bottom: 0; /* Remove default bottom margin */
+.main-tabs :deep(.p-tabview-panels code) { /* Style for API endpoint in Running Services */
+   background-color: #e9ecef;
+   padding: 0.2rem 0.4rem;
+   border-radius: 3px;
+   font-size: 0.85em;
    color: #495057;
-   text-align: center;
-   border-bottom: 1px solid #eee;
-   padding: 0.75rem 1rem; /* Adjust padding */
-}
- .chart-card :deep(.p-card-content) {
-    padding: 1rem; /* Consistent padding */
-    flex-grow: 1; /* Allow content to fill space */
-    display: flex; /* Center chart inside */
-    flex-direction: column; /* Stack elements vertically if needed */
-    justify-content: center;
-    align-items: center;
-    min-height: 300px; /* Ensure charts have enough height */
- }
-/* Styling for cards holding a single large chart */
-.single-chart-card :deep(.p-card-content) {
-    min-height: 450px; /* Larger height for combined charts */
-    padding: 1.5rem;
-}
-/* Target Chart component directly within the content */
-.chart-card :deep(.p-card-content .p-chart) {
-    width: 100%;
-    height: 100%;
+   word-break: break-all; /* Break long model IDs if needed */
 }
 
-
- .data-card-simple :deep(.p-card-content) {
-     min-height: auto; /* Reset min-height for stats */
-     padding: 1rem;
- }
- .stats-list {
-     list-style: none;
-     padding: 0;
-     margin: 0;
-     font-size: 0.95rem;
-     color: #495057;
- }
- .stats-list li {
-     padding: 0.5rem 0;
-     border-bottom: 1px dashed #eee;
-     display: flex;
-     justify-content: space-between;
- }
-  .stats-list li:last-child {
-      border-bottom: none;
-  }
-  .stat-label {
-      color: #6c757d;
-      margin-right: 1rem;
-  }
-  .stat-value {
-      font-weight: 500;
-      color: #343a40;
-  }
-
-.no-data-message {
+/* No Data / Error Messages in Tabs */
+.main-tabs :deep(.p-tabview-panels .no-data-message),
+.main-tabs :deep(.p-tabview-panels .error-message),
+.visualization-tabs :deep(.p-tabview-panels .no-data-message)
+ {
     padding: 2rem;
     text-align: center;
     color: #6c757d;
@@ -1348,89 +1386,52 @@ watch(visualizationData, (newData, oldData) => {
     align-items: center;
     justify-content: center;
     min-height: 150px;
+    margin-top: 1rem; /* Add some space */
 }
-.no-data-message i {
+.main-tabs :deep(.p-tabview-panels .no-data-message i),
+.visualization-tabs :deep(.p-tabview-panels .no-data-message i) {
     color: #ced4da;
 }
-
-
-.correlation-table :deep(td),
-.correlation-table :deep(th) {
-    text-align: center !important;
-    padding: 0.6rem 0.4rem !important;
-    font-size: 0.9rem;
-    white-space: nowrap;
-    border: 1px solid #eee;
-}
-.correlation-table :deep(th) {
-    background-color: #f8f9fa;
-    font-weight: 600;
-    color: #495057;
-    position: sticky; /* Make headers sticky */
-    top: 0;
-    z-index: 1;
+.main-tabs :deep(.p-tabview-panels .error-message) {
+    color: var(--red-700);
+    background-color: var(--red-100);
+    border: 1px solid var(--red-200);
 }
 
- .correlation-table :deep(td span) {
-     display: inline-block;
-     padding: 0.3rem 0.5rem;
-     border-radius: 4px;
-     min-width: 50px;
-     font-weight: 500;
-     border: 1px solid rgba(0,0,0,0.05);
-     line-height: 1.2; /* Adjust line height if text clashes */
- }
-  /* First column (row headers) styling */
- .correlation-table :deep(td:first-child),
- .correlation-table :deep(th:first-child) {
-     text-align: left !important;
-     font-weight: bold;
-     position: sticky; /* Keep row headers visible */
-     left: 0;
-     z-index: 2; /* Row header on top of cell content */
-      border-right: 2px solid #dee2e6 !important;
- }
- .correlation-table :deep(td:first-child) {
-      background-color: #f8f9fa !important;
-      /* Inherit text color */
-      color: inherit;
- }
- .correlation-table :deep(th:first-child) {
-      z-index: 3; /* Header corner on top */
- }
+/* Model Details Dialog */
+.model-details-dialog { font-size: 0.95rem; }
+.detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem 1.5rem; margin-bottom: 1.5rem; background-color: #f8f9fa; padding: 1.25rem; border-radius: 6px; border: 1px solid #e9ecef; }
+.detail-item label { font-weight: 600; color: #343a40; margin-right: 0.5rem; }
+.params-section { margin-top: 1.5rem; margin-bottom: 1.5rem; }
+.params-section h3 { margin-bottom: 0.75rem; color: #495057; }
+.params-section pre { background-color: #e9ecef; padding: 1rem; border-radius: 4px; max-height: 250px; overflow-y: auto; font-size: 0.85rem; border: 1px solid #dee2e6; white-space: pre-wrap; word-break: break-all;}
+.metrics-grid-dialog { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; margin-top: 1rem; }
+.metric-card-dialog { background: #ffffff; padding: 1rem; border-radius: 6px; text-align: center; border: 1px solid #dee2e6; transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out; }
+.metric-card-dialog:hover { transform: translateY(-3px); box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+.metric-title-dialog { font-weight: 600; color: #495057; margin-bottom: 0.5rem; font-size: 0.9rem; word-break: break-word; }
+.metric-value-dialog { font-size: 1.3rem; color: #007bff; font-weight: 500; word-break: break-all;}
+
+/* Main Loading / Error States */
+.loading-container.main-loading, .error-container.main-error { display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 400px; text-align: center; }
+.loading-container p { margin-top: 1rem; font-size: 1.1rem; color: #6c757d; }
+.error-container.main-error .p-message { margin-bottom: 1.5rem; }
 
 
-/* --- NEW Styles for Toggles and Chart Containers --- */
-.view-toggle-container {
-    display: flex;
-    justify-content: flex-end; /* Position toggle to the right */
-    margin-bottom: 1.5rem;
-}
-
-.chart-container {
-    margin-top: 1rem; /* Space below toggle if chart is shown */
-}
-
-/* Specific styling for the chart views if needed */
-.boxplot-chart-container,
-.heatmap-chart-container {
-    /* Container takes full width */
-    width: 100%;
-}
-
-/* --- Responsive Adjustments (Keep existing + potentially add more) --- */
+/* Responsive Adjustments */
 @media (max-width: 768px) {
+  .dataset-detail-view { padding: 1rem; }
   .header-section { flex-direction: column; align-items: flex-start; gap: 1rem; }
-  .header-right { width: 100%; justify-content: flex-start; flex-wrap: wrap; }
+  .header-right { width: 100%; justify-content: flex-start; }
   .description-section { flex-direction: column; }
   .image-container { max-width: 100%; max-height: 250px; }
-   .image-container :deep(img) { max-height: 200px; }
-  .charts-grid { grid-template-columns: 1fr; /* Stack cards vertically */ }
+  .image-container :deep(img) { max-height: 200px; }
+  .charts-grid { grid-template-columns: 1fr; /* Stack cards */ }
   .correlation-table { font-size: 0.8rem; }
   .correlation-table :deep(td), .correlation-table :deep(th) { padding: 0.4rem 0.2rem !important; }
-  .view-toggle-container { justify-content: center; /* Center toggle on small screens */ }
-  .single-chart-card :deep(.p-card-content) { min-height: 350px; } /* Reduce height slightly */
-
+  .view-toggle-container { justify-content: center; /* Center toggle */ }
+  .single-chart-card :deep(.p-card-content) { min-height: 350px; }
+  .detail-grid { grid-template-columns: 1fr; } /* Stack details */
+  .metrics-grid-dialog { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
 }
 
 </style>
